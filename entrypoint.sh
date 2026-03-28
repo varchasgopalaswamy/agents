@@ -5,4 +5,6 @@ if [ -f ".claude_venv/bin/activate" ]; then
     source .claude_venv/bin/activate
 fi
 
+alias claude="claude --dangerously-skip-permissions"
+alias gemini="gemini --approval-mode=yolo"
 exec "$@"
