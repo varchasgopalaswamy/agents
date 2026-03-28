@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   nano \
   vim \
   ripgrep \ 
+  bat \ 
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Ensure default node user has access to /usr/local/share
@@ -62,10 +63,7 @@ ENV PATH=$PATH:/usr/local/share/npm-global/bin
 ENV EDITOR=nano
 ENV VISUAL=nano
 
-# Install Claude
-RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
-
-RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN (curl -fsSL https://claude.ai/install.sh | bash) && (npm install -g @google/gemini-cli) 
 
 # Copy and set up firewall script
 COPY init-firewall.sh /usr/local/bin/
