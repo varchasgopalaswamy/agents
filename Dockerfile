@@ -73,14 +73,15 @@ RUN chmod +x /usr/local/bin/init-firewall.sh && \
   chmod 0440 /etc/sudoers.d/node-firewall
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-RUN export PATH="$HOME/.local/bin:$PATH" && export UV_PROJECT_ENVIRONMENT=".claude_venv"
-USER node
 
 # Copy the entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Make sure the script is executable
 RUN chmod +x /usr/local/bin/entrypoint.sh
+USER node
+
+RUN export PATH="$HOME/.local/bin:$PATH" && export UV_PROJECT_ENVIRONMENT=".claude_venv"
 
 # Set the entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
