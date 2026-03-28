@@ -75,4 +75,5 @@ RUN chmod +x /usr/local/bin/init-firewall.sh && \
   chmod 0440 /etc/sudoers.d/node-firewall
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+RUN export PATH="$HOME/.local/bin:$PATH" && export UV_PROJECT_ENVIRONMENT=".claude_venv"
 USER node
