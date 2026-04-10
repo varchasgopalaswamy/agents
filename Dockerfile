@@ -73,7 +73,7 @@ ENV PATH=$PATH:/usr/local/share/npm-global/bin
 ENV EDITOR=nano
 ENV VISUAL=nano
 
-RUN (curl -fsSL https://claude.ai/install.sh | bash) && (npm install -g @google/gemini-cli) 
+RUN (curl -fsSL https://claude.ai/install.sh | bash) && (npm install -g @google/gemini-cli @openai/codex @githubnext/github-copilot-cli) 
 
 # Copy and set up firewall script
 COPY init-firewall.sh /usr/local/bin/
