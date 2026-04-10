@@ -65,7 +65,8 @@ RUN ARCH=$(dpkg --print-architecture) && \
   wget "https://download.oracle.com/otn_software/linux/instantclient/${ORACLE_INSTANTCLIENT_SHORT}/instantclient-basic-${IC_ARCH}-${ORACLE_INSTANTCLIENT_VERSION}dbru.zip" -O /tmp/ic-basic.zip && \
   unzip /tmp/ic-basic.zip -d /opt/oracle && \
   rm /tmp/ic-basic.zip && \
-  echo /opt/oracle/instantclient_21_13 > /etc/ld.so.conf.d/oracle-instantclient.conf && \
+  IC_DIR=$(echo "${ORACLE_INSTANTCLIENT_VERSION}" | awk -F. '{print "instantclient_"$1"_"$2}') && \
+  echo /opt/oracle/${IC_DIR} > /etc/ld.so.conf.d/oracle-instantclient.conf && \
   ldconfig
 
 # Set up non-root user
