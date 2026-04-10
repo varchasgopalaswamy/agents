@@ -1,4 +1,5 @@
-FROM ghcr.io/oracle/oraclelinux9-instantclient:23 AS oracle-ic
+ARG ORACLE_IC_VERSION=23
+FROM ghcr.io/oracle/oraclelinux9-instantclient:${ORACLE_IC_VERSION} AS oracle-ic
 
 FROM node:20
 
@@ -57,7 +58,8 @@ RUN ARCH=$(dpkg --print-architecture) && \
 
 # Install Oracle Instant Client (copied from official Oracle image)
 COPY --from=oracle-ic /usr/lib/oracle /usr/lib/oracle
-RUN echo /usr/lib/oracle/23/client64/lib > /etc/ld.so.conf.d/oracle-instantclient.conf && \
+RUN IC_LIB_DIR=$(find /usr/lib/oracle -maxdepth 3 -name "lib" -type d | head -1) && \
+  echo "${IC_LIB_DIR}" > /etc/ld.so.conf.d/oracle-instantclient.conf && \
   ldconfig
 
 # Set up non-root user
