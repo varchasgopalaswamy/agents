@@ -9,7 +9,7 @@ export NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 export PATH="$HOME/.local/bin:/usr/local/share/npm-global/bin:$PATH"
 
 # UV project environment
-export UV_PROJECT_ENVIRONMENT=".claude_venv"
+export UV_PROJECT_ENVIRONMENT="$HOME/.venv"
 
 # Default editor
 export EDITOR=nano
