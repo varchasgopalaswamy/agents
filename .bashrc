@@ -18,6 +18,7 @@ export VISUAL=nano
 # Aliases
 alias claude="claude --dangerously-skip-permissions"
 alias gemini="gemini --approval-mode=yolo"
+alias opencode="opencode"
 alias codex="codex --approval-mode=full-auto"
 
 # Activate virtual environment if present
