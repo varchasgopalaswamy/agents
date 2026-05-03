@@ -54,10 +54,14 @@ fi
 # ---------------------------------------------------------------------------
 # Persistent directories on the host
 # ---------------------------------------------------------------------------
-HISTORY_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/agents/commandhistory"
-CLAUDE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude"
-
-mkdir -p "$HISTORY_DIR" "$CLAUDE_DIR"
+CLAUDE_DIR="${$HOME}/.claude"
+CLAUDE_JSON="${$HOME}/.claude.json"
+GEMINI_DIR="${HOME}/.gemini"
+CODEX_DIR="${HOME}/.codex"
+VENV_DIR="${HOME}/.agents_venv"
+UV_CACHE_DIR="${HOME}/.cache/uv"
+mkdir -p ${CLAUDE_DIR} ${GEMINI_DIR} ${CODEX_DIR} ${VENV_DIR}
+touch ${CLAUDE_JSON}
 
 # ---------------------------------------------------------------------------
 # Build volume mounts
@@ -65,21 +69,13 @@ mkdir -p "$HISTORY_DIR" "$CLAUDE_DIR"
 MOUNTS=(
     # Current directory as the workspace inside the container
     "--volume=$(pwd):/workspace:z"
-    # Persistent bash history across container runs
-    "--volume=${HISTORY_DIR}:/commandhistory:z"
-    # Claude configuration / credentials
-    "--volume=${CLAUDE_DIR}:/home/node/.claude:z"
+    "--volume=${CLAUDE_DIR}:/home/agent/.claude:z"
+    "--volume=${GEMINI_DIR}:/home/agent/.gemini:z"
+    "--volume=${CODEX_DIR}:/home/agent/.codex:z"
+    "--volume=${CLAUDE_JSON}:/home/agent/.claude.json:z"
+    "--volume=${VENV_DIR}:/home/agent/.venv:z"
+    "--volume=${UV_CACHE_DIR}:/home/agent/.cache/uv:z"
 )
-
-# SSH keys — mount read-only so the agent can push/pull via SSH
-if [[ -d "$HOME/.ssh" ]]; then
-    MOUNTS+=("--volume=${HOME}/.ssh:/home/node/.ssh:ro,z")
-fi
-
-# Git configuration
-if [[ -f "$HOME/.gitconfig" ]]; then
-    MOUNTS+=("--volume=${HOME}/.gitconfig:/home/node/.gitconfig:ro,z")
-fi
 
 # ---------------------------------------------------------------------------
 # Environment variables forwarded into the container
@@ -98,8 +94,6 @@ forward_env CLAUDE_API_KEY
 forward_env GOOGLE_API_KEY
 forward_env GEMINI_API_KEY
 forward_env OPENAI_API_KEY
-forward_env GITHUB_TOKEN
-forward_env GH_TOKEN
 forward_env TZ
 
 # ---------------------------------------------------------------------------
