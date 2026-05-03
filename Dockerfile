@@ -35,11 +35,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   libgssapi-krb5-2 \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Ensure default node user has access to /usr/local/share
-RUN mkdir -p /usr/local/share/npm-global && \
-  chown -R node:node /usr/local/share
+# Create the agent user and set up npm-global directory
+RUN useradd -m -s /bin/bash agent && \
+  mkdir -p /usr/local/share/npm-global && \
+  chown -R agent:agent /usr/local/share
 
-ARG USERNAME=node
+ARG USERNAME=agent
 
 # Persist bash history.
 RUN SNIPPET="export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhistory/.bash_history" \
@@ -48,8 +49,8 @@ RUN SNIPPET="export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhisto
   && chown -R $USERNAME /commandhistory
 
 # Create workspace and config directories and set permissions
-RUN mkdir -p /workspace /home/node/.claude && \
-  chown -R node:node /workspace /home/node/.claude
+RUN mkdir -p /workspace /home/agent/.claude && \
+  chown -R agent:agent /workspace /home/agent/.claude
 
 WORKDIR /workspace
 
@@ -66,7 +67,7 @@ RUN IC_LIB_DIR=$(find /usr/lib/oracle -maxdepth 3 -name "lib" -type d | head -1)
   ldconfig
 
 # Set up non-root user
-USER node
+USER agent
 
 # Install global packages
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
@@ -82,20 +83,20 @@ RUN (curl -fsSL https://claude.ai/install.sh | bash) && (npm install -g @google/
 COPY init-firewall.sh /usr/local/bin/
 USER root
 RUN chmod +x /usr/local/bin/init-firewall.sh && \
-  echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node-firewall && \
-  chmod 0440 /etc/sudoers.d/node-firewall
+  echo "agent ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/agent-firewall && \
+  chmod 0440 /etc/sudoers.d/agent-firewall
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# Copy .bashrc for the node user
-COPY --chown=node:node .bashrc /home/node/.bashrc
+# Copy .bashrc for the agent user
+COPY --chown=agent:agent .bashrc /home/agent/.bashrc
 
 # Copy the entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Make sure the script is executable
 RUN chmod +x /usr/local/bin/entrypoint.sh
-USER node
+USER agent
 
 # Set the entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
