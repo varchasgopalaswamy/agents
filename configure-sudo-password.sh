@@ -2,7 +2,10 @@
 set -euo pipefail
 
 AGENT_USER="${AGENT_USER:-agent}"
-SUDOERS_FILE="/etc/sudoers.d/agent-user-sudo"
+# Keep this file lexically before the bootstrap sudoers files so their
+# command-specific NOPASSWD rules still apply until entrypoint revokes them.
+SUDOERS_FILE="/etc/sudoers.d/00-agent-user-sudo"
+LEGACY_SUDOERS_FILE="/etc/sudoers.d/agent-user-sudo"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: configure-sudo-password.sh must run as root" >&2
@@ -41,6 +44,7 @@ printf '%s:%s\n' "$AGENT_USER" "$password" | chpasswd
 password=
 confirm=
 
+rm -f "$LEGACY_SUDOERS_FILE"
 printf '%s ALL=(ALL:ALL) ALL\n' "$AGENT_USER" > "$SUDOERS_FILE"
 chmod 0440 "$SUDOERS_FILE"
 
