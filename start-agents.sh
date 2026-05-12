@@ -44,7 +44,7 @@ def resolve_image_and_extra_args(argv: list[str]) -> tuple[str, list[str]]:
     return DEFAULT_IMAGE, argv
 
 
-def resolve_timezone() -> None:
+def ensure_timezone_env() -> None:
     if os.environ.get("TZ"):
         return
     localtime = Path("/etc/localtime")
@@ -108,7 +108,7 @@ def build_env_args() -> list[str]:
 def main() -> None:
     runtime = resolve_runtime()
     image, extra_args = resolve_image_and_extra_args(sys.argv[1:])
-    resolve_timezone()
+    ensure_timezone_env()
 
     mounts = build_mounts(ensure_host_paths())
     env_args = build_env_args()
