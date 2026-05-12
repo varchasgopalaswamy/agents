@@ -43,7 +43,6 @@ ALLOWED_DOMAINS=(
     "pypi.org"
     "registry.npmjs.org"
     "sentry.io"
-    "statsig.anthropic.com"
     "statsig.com"
     "update.code.visualstudio.com"
     "vscode.blob.core.windows.net"
