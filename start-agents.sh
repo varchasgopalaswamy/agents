@@ -1,117 +1,139 @@
-#!/bin/bash
-# start-agents.sh — launch the agents container with podman or docker.
-#
-# Install:
-#   cp start-agents.sh ~/.local/bin/start-agents
-#   chmod +x ~/.local/bin/start-agents
-#
-# Usage:
-#   start-agents [IMAGE] [EXTRA_ARGS...]
-#
-#   IMAGE        Container image to run (default: ghcr.io/varchasgopalaswamy/agents:latest)
-#   EXTRA_ARGS   Any additional arguments forwarded to podman/docker run
-#
-# Environment variables honored at launch time (passed into the container):
-#   ANTHROPIC_API_KEY, CLAUDE_API_KEY
-#   GOOGLE_API_KEY, GEMINI_API_KEY
-#   OPENAI_API_KEY
-#   GITHUB_TOKEN, GH_TOKEN
-#   TZ  (defaults to the host timezone if /etc/localtime is available)
+#!/usr/bin/env python3
+"""
+start-agents.sh — launch the agents container with podman or docker.
 
-set -euo pipefail
+Install:
+  cp start-agents.sh ~/.local/bin/start-agents
+  chmod +x ~/.local/bin/start-agents
 
-# ---------------------------------------------------------------------------
-# Resolve container runtime
-# ---------------------------------------------------------------------------
-if command -v podman &>/dev/null; then
-    RUNTIME=podman
-elif command -v docker &>/dev/null; then
-    RUNTIME=docker
-else
-    echo "ERROR: neither podman nor docker found on PATH" >&2
-    exit 1
-fi
+Usage:
+  start-agents [IMAGE] [EXTRA_ARGS...]
 
-# ---------------------------------------------------------------------------
-# Image
-# ---------------------------------------------------------------------------
-IMAGE="${1:-ghcr.io/varchasgopalaswamy/agents:latest}"
-# If the first argument looks like an option (starts with -) treat it as an
-# extra arg and keep the default image.
-if [[ "$IMAGE" == -* ]]; then
-    IMAGE="ghcr.io/varchasgopalaswamy/agents:latest"
-else
-    shift || true   # consume the IMAGE argument
-fi
+  IMAGE        Container image to run (default: ghcr.io/varchasgopalaswamy/agents:latest)
+  EXTRA_ARGS   Any additional arguments forwarded to podman/docker run
 
-# ---------------------------------------------------------------------------
-# Timezone
-# ---------------------------------------------------------------------------
-if [[ -z "${TZ:-}" ]] && [[ -f /etc/localtime ]]; then
-    TZ=$(readlink -f /etc/localtime | sed 's|.*zoneinfo/||')
-fi
+Environment variables honored at launch time (passed into the container):
+  ANTHROPIC_API_KEY, CLAUDE_API_KEY
+  GOOGLE_API_KEY, GEMINI_API_KEY
+  OPENAI_API_KEY
+  GITHUB_TOKEN, GH_TOKEN
+  TZ  (defaults to the host timezone if /etc/localtime is available)
+"""
 
-# ---------------------------------------------------------------------------
-# Persistent directories on the host
-# ---------------------------------------------------------------------------
-CLAUDE_DIR="${$HOME}/.claude"
-CLAUDE_JSON="${$HOME}/.claude.json"
-GEMINI_DIR="${HOME}/.gemini"
-CODEX_DIR="${HOME}/.codex"
-VENV_DIR="${HOME}/.agents_venv"
-UV_CACHE_DIR="${HOME}/.cache/uv"
-mkdir -p ${CLAUDE_DIR} ${GEMINI_DIR} ${CODEX_DIR} ${VENV_DIR}
-touch ${CLAUDE_JSON}
+from __future__ import annotations
 
-# ---------------------------------------------------------------------------
-# Build volume mounts
-# ---------------------------------------------------------------------------
-MOUNTS=(
-    # Current directory as the workspace inside the container
-    "--volume=$(pwd):/workspace:z"
-    "--volume=${CLAUDE_DIR}:/home/agent/.claude:z"
-    "--volume=${GEMINI_DIR}:/home/agent/.gemini:z"
-    "--volume=${CODEX_DIR}:/home/agent/.codex:z"
-    "--volume=${CLAUDE_JSON}:/home/agent/.claude.json:z"
-    "--volume=${VENV_DIR}:/home/agent/.venv:z"
-    "--volume=${UV_CACHE_DIR}:/home/agent/.cache/uv:z"
-)
+import os
+import shutil
+import sys
+from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Environment variables forwarded into the container
-# ---------------------------------------------------------------------------
-ENV_VARS=()
+DEFAULT_IMAGE = "ghcr.io/varchasgopalaswamy/agents:latest"
 
-forward_env() {
-    local var="$1"
-    if [[ -n "${!var:-}" ]]; then
-        ENV_VARS+=("--env=${var}=${!var}")
-    fi
-}
 
-forward_env ANTHROPIC_API_KEY
-forward_env CLAUDE_API_KEY
-forward_env GOOGLE_API_KEY
-forward_env GEMINI_API_KEY
-forward_env OPENAI_API_KEY
-forward_env TZ
+def resolve_runtime() -> str:
+    for runtime in ("podman", "docker"):
+        if shutil.which(runtime):
+            return runtime
+    print("ERROR: neither podman nor docker found on PATH", file=sys.stderr)
+    sys.exit(1)
 
-# ---------------------------------------------------------------------------
-# Launch
-# ---------------------------------------------------------------------------
-echo "Starting agents container with ${RUNTIME}..."
-echo "  Image    : ${IMAGE}"
-echo "  Workspace: $(pwd)"
 
-exec "$RUNTIME" run \
-    --rm \
-    --interactive \
-    --tty \
-    # NET_ADMIN and NET_RAW are required by init-firewall.sh, which uses
-    # iptables/ipset to restrict outbound traffic to an allowlist of domains.
-    --cap-add=NET_ADMIN \
-    --cap-add=NET_RAW \
-    "${MOUNTS[@]}" \
-    "${ENV_VARS[@]}" \
-    "$@" \
-    "$IMAGE"
+def resolve_image_and_extra_args(argv: list[str]) -> tuple[str, list[str]]:
+    if argv and not argv[0].startswith("-"):
+        return argv[0], argv[1:]
+    return DEFAULT_IMAGE, argv
+
+
+def ensure_timezone_env() -> None:
+    if os.environ.get("TZ"):
+        return
+    localtime = Path("/etc/localtime")
+    if not localtime.exists():
+        return
+    resolved = localtime.resolve()
+    marker = "/zoneinfo/"
+    resolved_str = str(resolved)
+    if marker in resolved_str:
+        os.environ["TZ"] = resolved_str.split(marker, 1)[1]
+
+
+def ensure_host_paths() -> dict[str, Path]:
+    home = Path.home()
+    paths = {
+        "claude_dir": home / ".claude",
+        "claude_json": home / ".claude.json",
+        "gemini_dir": home / ".gemini",
+        "codex_dir": home / ".codex",
+        "venv_dir": home / ".agents_venv",
+        "uv_cache_dir": home / ".cache" / "uv",
+    }
+
+    for key in ("claude_dir", "gemini_dir", "codex_dir", "venv_dir", "uv_cache_dir"):
+        paths[key].mkdir(parents=True, exist_ok=True)
+    paths["claude_json"].touch(exist_ok=True)
+    return paths
+
+
+def build_mounts(paths: dict[str, Path]) -> list[str]:
+    workspace = Path.cwd()
+    return [
+        f"--volume={workspace}:/workspace:z",
+        f"--volume={paths['claude_dir']}:/home/agent/.claude:z",
+        f"--volume={paths['gemini_dir']}:/home/agent/.gemini:z",
+        f"--volume={paths['codex_dir']}:/home/agent/.codex:z",
+        f"--volume={paths['claude_json']}:/home/agent/.claude.json:z",
+        f"--volume={paths['venv_dir']}:/home/agent/.venv:z",
+        f"--volume={paths['uv_cache_dir']}:/home/agent/.cache/uv:z",
+    ]
+
+
+def build_env_args() -> list[str]:
+    env_args: list[str] = []
+    for name in (
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+        "OPENAI_API_KEY",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "TZ",
+    ):
+        value = os.environ.get(name)
+        if value:
+            env_args.append(f"--env={name}={value}")
+    return env_args
+
+
+def main() -> None:
+    runtime = resolve_runtime()
+    image, extra_args = resolve_image_and_extra_args(sys.argv[1:])
+    ensure_timezone_env()
+
+    mounts = build_mounts(ensure_host_paths())
+    env_args = build_env_args()
+
+    print(f"Starting agents container with {runtime}...")
+    print(f"  Image    : {image}")
+    print(f"  Workspace: {Path.cwd()}")
+
+    command = [
+        runtime,
+        "run",
+        "--rm",
+        "--interactive",
+        "--tty",
+        # NET_ADMIN and NET_RAW are required by init-firewall.sh, which uses
+        # iptables/ipset to restrict outbound traffic to an allowlist of domains.
+        "--cap-add=NET_ADMIN",
+        "--cap-add=NET_RAW",
+        *mounts,
+        *env_args,
+        *extra_args,
+        image,
+    ]
+    os.execvp(runtime, command)
+
+
+if __name__ == "__main__":
+    main()
