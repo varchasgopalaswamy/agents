@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-start-agents.sh — launch the agents container with podman or docker.
+start-agents — launch the agents container with podman or docker.
 
 Install:
-  cp start-agents.sh ~/.local/bin/start-agents
+  cp start-agents ~/.local/bin/start-agents
   chmod +x ~/.local/bin/start-agents
 
 Usage:
@@ -17,7 +17,11 @@ Environment variables honored at launch time (passed into the container):
   GOOGLE_API_KEY, GEMINI_API_KEY
   OPENAI_API_KEY
   GITHUB_TOKEN, GH_TOKEN
+  AGENTS_DISABLE_FIREWALL, AGENTS_ALLOW_HOST_NETWORK, AGENTS_KEEP_FIREWALL_SUDO
   TZ  (defaults to the host timezone if /etc/localtime is available)
+
+Launcher-only override:
+  AGENTS_ALLOW_UNSAFE_FLAGS=1
 """
 
 from __future__ import annotations
@@ -28,6 +32,11 @@ import sys
 from pathlib import Path
 
 DEFAULT_IMAGE = "ghcr.io/varchasgopalaswamy/agents:latest"
+UNSAFE_OVERRIDE_ENV = "AGENTS_ALLOW_UNSAFE_FLAGS"
+
+
+class UnsafeRunArg(ValueError):
+    pass
 
 
 def resolve_runtime() -> str:
@@ -42,6 +51,124 @@ def resolve_image_and_extra_args(argv: list[str]) -> tuple[str, list[str]]:
     if argv and not argv[0].startswith("-"):
         return argv[0], argv[1:]
     return DEFAULT_IMAGE, argv
+
+
+def reject_unsafe_extra_args(extra_args: list[str]) -> None:
+    if os.environ.get(UNSAFE_OVERRIDE_ENV) == "1":
+        return
+
+    violations: list[str] = []
+    pending_flag: str | None = None
+    for arg in extra_args:
+        if pending_flag:
+            reason = unsafe_flag_value_reason(pending_flag, arg)
+            if reason:
+                violations.append(f"{pending_flag} {arg}: {reason}")
+            pending_flag = None
+            continue
+
+        if arg == "--privileged":
+            violations.append("--privileged: disables the container isolation this launcher relies on")
+            continue
+
+        if arg in {
+            "--network",
+            "--net",
+            "--pid",
+            "--ipc",
+            "--uts",
+            "--userns",
+            "--cap-add",
+            "--security-opt",
+            "--user",
+            "-u",
+            "--entrypoint",
+            "-v",
+            "--volume",
+            "--mount",
+        }:
+            pending_flag = arg
+            continue
+
+        if arg == "--device" or arg.startswith("--device="):
+            violations.append(f"{arg}: device passthrough can bypass the sandbox")
+            continue
+
+        for prefix in (
+            "--network=",
+            "--net=",
+            "--pid=",
+            "--ipc=",
+            "--uts=",
+            "--userns=",
+            "--cap-add=",
+            "--security-opt=",
+            "--user=",
+            "--entrypoint=",
+            "--volume=",
+            "--mount=",
+        ):
+            if arg.startswith(prefix):
+                flag = prefix[:-1]
+                value = arg.removeprefix(prefix)
+                reason = unsafe_flag_value_reason(flag, value)
+                if reason:
+                    violations.append(f"{arg}: {reason}")
+                break
+
+    if violations:
+        formatted = "\n  ".join(violations)
+        raise UnsafeRunArg(
+            "refusing unsafe container option(s):\n"
+            f"  {formatted}\n"
+            f"Set {UNSAFE_OVERRIDE_ENV}=1 to pass them through anyway."
+        )
+
+
+def unsafe_flag_value_reason(flag: str, value: str) -> str | None:
+    if flag in {"--network", "--net"} and value == "host":
+        return "host networking would let the firewall script modify the host network namespace"
+    if flag in {"--pid", "--ipc", "--uts"} and value == "host":
+        return "sharing host namespaces weakens process and system isolation"
+    if flag == "--userns" and value == "host":
+        return "sharing the host user namespace weakens filesystem isolation"
+    if flag == "--cap-add" and value.upper() not in {"NET_ADMIN", "NET_RAW"}:
+        return "extra Linux capabilities are broader than the firewall needs"
+    if flag == "--security-opt" and value in {
+        "apparmor=unconfined",
+        "label=disable",
+        "no-new-privileges=false",
+        "seccomp=unconfined",
+    }:
+        return "this disables a runtime security boundary"
+    if flag in {"--user", "-u"} and any(part in {"0", "root"} for part in value.split(":")):
+        return "running the agent as root would let it alter the container firewall"
+    if flag == "--entrypoint":
+        return "overriding the entrypoint bypasses Python and firewall initialization"
+    if flag in {"-v", "--volume"}:
+        source = value.split(":", 1)[0]
+        if source == "/":
+            return "mounting the host root filesystem exposes the host"
+        if source in {"/var/run/docker.sock", "/run/docker.sock"}:
+            return "mounting the container runtime socket grants host-level control"
+    if flag == "--mount":
+        mount_options = parse_mount_options(value)
+        source = mount_options.get("source") or mount_options.get("src")
+        if source == "/":
+            return "mounting the host root filesystem exposes the host"
+        if source in {"/var/run/docker.sock", "/run/docker.sock"}:
+            return "mounting the container runtime socket grants host-level control"
+    return None
+
+
+def parse_mount_options(value: str) -> dict[str, str]:
+    options: dict[str, str] = {}
+    for item in value.split(","):
+        if "=" not in item:
+            continue
+        key, mount_value = item.split("=", 1)
+        options[key] = mount_value
+    return options
 
 
 def ensure_timezone_env() -> None:
@@ -60,6 +187,7 @@ def ensure_timezone_env() -> None:
 def ensure_host_paths() -> dict[str, Path]:
     home = Path.home()
     paths = {
+        "command_history_dir": home / ".local" / "share" / "agents" / "commandhistory",
         "claude_dir": home / ".claude",
         "claude_json": home / ".claude.json",
         "gemini_dir": home / ".gemini",
@@ -68,7 +196,7 @@ def ensure_host_paths() -> dict[str, Path]:
         "uv_cache_dir": home / ".cache" / "uv",
     }
 
-    for key in ("claude_dir", "gemini_dir", "codex_dir", "venv_dir", "uv_cache_dir"):
+    for key in ("command_history_dir", "claude_dir", "gemini_dir", "codex_dir", "venv_dir", "uv_cache_dir"):
         paths[key].mkdir(parents=True, exist_ok=True)
     paths["claude_json"].touch(exist_ok=True)
     return paths
@@ -78,6 +206,7 @@ def build_mounts(paths: dict[str, Path]) -> list[str]:
     workspace = Path.cwd()
     return [
         f"--volume={workspace}:/workspace:z",
+        f"--volume={paths['command_history_dir']}:/commandhistory:z",
         f"--volume={paths['claude_dir']}:/home/agent/.claude:z",
         f"--volume={paths['gemini_dir']}:/home/agent/.gemini:z",
         f"--volume={paths['codex_dir']}:/home/agent/.codex:z",
@@ -97,17 +226,25 @@ def build_env_args() -> list[str]:
         "OPENAI_API_KEY",
         "GITHUB_TOKEN",
         "GH_TOKEN",
+        "AGENTS_DISABLE_FIREWALL",
+        "AGENTS_ALLOW_HOST_NETWORK",
+        "AGENTS_KEEP_FIREWALL_SUDO",
         "TZ",
     ):
-        value = os.environ.get(name)
-        if value:
-            env_args.append(f"--env={name}={value}")
+        if os.environ.get(name):
+            env_args.append(f"--env={name}")
     return env_args
 
 
 def main() -> None:
-    runtime = resolve_runtime()
     image, extra_args = resolve_image_and_extra_args(sys.argv[1:])
+    try:
+        reject_unsafe_extra_args(extra_args)
+    except UnsafeRunArg as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(2)
+
+    runtime = resolve_runtime()
     ensure_timezone_env()
 
     mounts = build_mounts(ensure_host_paths())

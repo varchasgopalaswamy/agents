@@ -1,137 +1,259 @@
 #!/bin/bash
-set -euo pipefail  # Exit on error, undefined vars, and pipeline failures
-IFS=$'\n\t'       # Stricter word splitting
+set -euo pipefail
+IFS=$'\n\t'
 
-# 1. Extract Docker DNS info BEFORE any flushing
-DOCKER_DNS_RULES=$(iptables-save -t nat | grep "127\.0\.0\.11" || true)
+ALLOW_HOST_NETWORK=0
+KEEP_SUDO=0
 
-# Flush existing rules and delete existing ipsets
-iptables -F
-iptables -X
-iptables -t nat -F
-iptables -t nat -X
-iptables -t mangle -F
-iptables -t mangle -X
-ipset destroy allowed-domains 2>/dev/null || true
+for arg in "$@"; do
+    case "$arg" in
+        --allow-host-network)
+            ALLOW_HOST_NETWORK=1
+            ;;
+        --keep-sudo)
+            KEEP_SUDO=1
+            ;;
+        *)
+            echo "ERROR: unknown firewall option: $arg" >&2
+            exit 2
+            ;;
+    esac
+done
 
-# 2. Selectively restore ONLY internal Docker DNS resolution
-if [ -n "$DOCKER_DNS_RULES" ]; then
-    echo "Restoring Docker DNS rules..."
-    iptables -t nat -N DOCKER_OUTPUT 2>/dev/null || true
-    iptables -t nat -N DOCKER_POSTROUTING 2>/dev/null || true
-    echo "$DOCKER_DNS_RULES" | xargs -L 1 iptables -t nat
-else
-    echo "No Docker DNS rules to restore"
-fi
-
-# First allow DNS and localhost before any restrictions
-# Allow outbound DNS
-iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-# Allow inbound DNS responses
-iptables -A INPUT -p udp --sport 53 -j ACCEPT
-# Allow outbound SSH
-iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT
-# Allow inbound SSH responses
-iptables -A INPUT -p tcp --sport 22 -m state --state ESTABLISHED -j ACCEPT
-# Allow localhost
-iptables -A INPUT -i lo -j ACCEPT
-iptables -A OUTPUT -o lo -j ACCEPT
-
-# Create ipset with CIDR support
-ipset create allowed-domains hash:net
-
-# Fetch GitHub meta information and aggregate + add their IP ranges
-echo "Fetching GitHub IP ranges..."
-gh_ranges=$(curl -s https://api.github.com/meta)
-if [ -z "$gh_ranges" ]; then
-    echo "ERROR: Failed to fetch GitHub IP ranges"
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: init-firewall.sh must run as root" >&2
     exit 1
 fi
 
-if ! echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null; then
-    echo "ERROR: GitHub API response missing required fields"
-    exit 1
-fi
+ALLOWED_SET="allowed-domains"
+ALLOWED_DOMAINS=(
+    "accounts.google.com"
+    "api.anthropic.com"
+    "api.githubcopilot.com"
+    "api.openai.com"
+    "auth.openai.com"
+    "chatgpt.com"
+    "claude.ai"
+    "cloudcode-pa.googleapis.com"
+    "copilot-proxy.githubusercontent.com"
+    "files.pythonhosted.org"
+    "generativelanguage.googleapis.com"
+    "marketplace.visualstudio.com"
+    "oauth2.googleapis.com"
+    "pypi.org"
+    "registry.npmjs.org"
+    "sentry.io"
+    "statsig.anthropic.com"
+    "statsig.com"
+    "update.code.visualstudio.com"
+    "vscode.blob.core.windows.net"
+    "www.googleapis.com"
+)
 
-echo "Processing GitHub IPs..."
-while read -r cidr; do
-    if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-        echo "ERROR: Invalid CIDR range from GitHub meta: $cidr"
+is_ipv4() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+is_ipv4_cidr() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]
+}
+
+have_ip6tables() {
+    command -v ip6tables >/dev/null 2>&1 && ip6tables -L >/dev/null 2>&1
+}
+
+reset_ipv4_firewall() {
+    iptables -P INPUT ACCEPT || true
+    iptables -P FORWARD ACCEPT || true
+    iptables -P OUTPUT ACCEPT || true
+    iptables -F
+    iptables -X
+    iptables -t nat -F
+    iptables -t nat -X
+    iptables -t mangle -F
+    iptables -t mangle -X
+    ipset destroy "$ALLOWED_SET" 2>/dev/null || true
+}
+
+drop_ipv6_firewall() {
+    if ! have_ip6tables; then
+        echo "IPv6 firewall unavailable; skipping IPv6 rules"
+        return
+    fi
+
+    ip6tables -P INPUT ACCEPT || true
+    ip6tables -P FORWARD ACCEPT || true
+    ip6tables -P OUTPUT ACCEPT || true
+    ip6tables -F
+    ip6tables -X
+    ip6tables -t mangle -F 2>/dev/null || true
+    ip6tables -t mangle -X 2>/dev/null || true
+
+    ip6tables -A INPUT -i lo -j ACCEPT
+    ip6tables -A OUTPUT -o lo -j ACCEPT
+    ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    ip6tables -A OUTPUT -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || ip6tables -A OUTPUT -j REJECT
+
+    ip6tables -P INPUT DROP
+    ip6tables -P FORWARD DROP
+    ip6tables -P OUTPUT DROP
+}
+
+restore_docker_dns_rules() {
+    local docker_dns_rules="$1"
+
+    if [ -n "$docker_dns_rules" ]; then
+        echo "Restoring Docker DNS NAT rules..."
+        iptables -t nat -N DOCKER_OUTPUT 2>/dev/null || true
+        iptables -t nat -N DOCKER_POSTROUTING 2>/dev/null || true
+        echo "$docker_dns_rules" | xargs -L 1 iptables -t nat
+    else
+        echo "No Docker DNS NAT rules to restore"
+    fi
+}
+
+allow_base_ipv4_traffic() {
+    iptables -A INPUT -i lo -j ACCEPT
+    iptables -A OUTPUT -o lo -j ACCEPT
+    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+    while read -r resolver; do
+        if is_ipv4 "$resolver"; then
+            echo "Allowing DNS resolver $resolver"
+            iptables -A OUTPUT -p udp -d "$resolver" --dport 53 -j ACCEPT
+            iptables -A OUTPUT -p tcp -d "$resolver" --dport 53 -j ACCEPT
+        fi
+    done < <(awk '/^nameserver / {print $2}' /etc/resolv.conf)
+}
+
+add_github_ranges() {
+    echo "Fetching GitHub IP ranges..."
+    local gh_ranges
+    gh_ranges=$(curl -fsSL --retry 3 https://api.github.com/meta)
+
+    if ! echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null; then
+        echo "ERROR: GitHub API response missing required fields" >&2
         exit 1
     fi
-    echo "Adding GitHub range $cidr"
-    ipset add allowed-domains "$cidr"
-done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
 
-# Resolve and add other allowed domains
-for domain in \
-    "registry.npmjs.org" \
-    "api.anthropic.com" \
-    "sentry.io" \
-    "statsig.anthropic.com" \
-    "statsig.com" \
-    "marketplace.visualstudio.com" \
-    "vscode.blob.core.windows.net" \
-    "update.code.visualstudio.com"; do
-    echo "Resolving $domain..."
-    ips=$(dig +noall +answer A "$domain" | awk '$4 == "A" {print $5}')
+    echo "Processing GitHub IP ranges..."
+    while read -r cidr; do
+        if ! is_ipv4_cidr "$cidr"; then
+            echo "ERROR: Invalid CIDR range from GitHub meta: $cidr" >&2
+            exit 1
+        fi
+        echo "Adding GitHub range $cidr"
+        ipset -exist add "$ALLOWED_SET" "$cidr"
+    done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git + (.packages // []))[]' | aggregate -q)
+}
+
+add_allowed_domain() {
+    local domain="$1"
+    local ips
+    ips=$(dig +short A "$domain" | awk '/^[0-9.]+$/ {print $1}')
+
     if [ -z "$ips" ]; then
-        echo "ERROR: Failed to resolve $domain"
+        echo "ERROR: Failed to resolve $domain" >&2
         exit 1
     fi
-    
+
     while read -r ip; do
-        if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo "ERROR: Invalid IP from DNS for $domain: $ip"
+        if ! is_ipv4 "$ip"; then
+            echo "ERROR: Invalid IP from DNS for $domain: $ip" >&2
             exit 1
         fi
         echo "Adding $ip for $domain"
-        ipset add allowed-domains "$ip"
+        ipset -exist add "$ALLOWED_SET" "$ip"
     done < <(echo "$ips")
-done
+}
 
-# Get host IP from default route
-HOST_IP=$(ip route | grep default | cut -d" " -f3)
-if [ -z "$HOST_IP" ]; then
-    echo "ERROR: Failed to detect host IP"
-    exit 1
-fi
+add_allowed_domains() {
+    for domain in "${ALLOWED_DOMAINS[@]}"; do
+        echo "Resolving $domain..."
+        add_allowed_domain "$domain"
+    done
+}
 
-HOST_NETWORK=$(echo "$HOST_IP" | sed "s/\.[0-9]*$/.0\/24/")
-echo "Host network detected as: $HOST_NETWORK"
+allow_host_gateway_if_requested() {
+    if [ "$ALLOW_HOST_NETWORK" != "1" ]; then
+        echo "Host gateway access disabled"
+        return
+    fi
 
-# Set up remaining iptables rules
-iptables -A INPUT -s "$HOST_NETWORK" -j ACCEPT
-iptables -A OUTPUT -d "$HOST_NETWORK" -j ACCEPT
+    local host_ip
+    host_ip=$(ip route | awk '/default/ {print $3; exit}')
+    if [ -z "$host_ip" ] || ! is_ipv4 "$host_ip"; then
+        echo "ERROR: Failed to detect host gateway IP" >&2
+        exit 1
+    fi
 
-# Set default policies to DROP first
-iptables -P INPUT DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT DROP
+    echo "Allowing host gateway access: $host_ip"
+    iptables -A INPUT -s "$host_ip" -j ACCEPT
+    iptables -A OUTPUT -d "$host_ip" -j ACCEPT
+}
 
-# First allow established connections for already approved traffic
-iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+apply_default_denies() {
+    iptables -P INPUT DROP
+    iptables -P FORWARD DROP
+    iptables -P OUTPUT DROP
 
-# Then allow only specific outbound traffic to allowed domains
-iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
+    iptables -A OUTPUT -m set --match-set "$ALLOWED_SET" dst -j ACCEPT
+    iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
+}
 
-# Explicitly REJECT all other outbound traffic for immediate feedback
-iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
+verify_blocked() {
+    local url="$1"
+    local label="$2"
+
+    if curl --connect-timeout 5 --max-time 8 "$url" >/dev/null 2>&1; then
+        echo "ERROR: Firewall verification failed - reached $label" >&2
+        exit 1
+    fi
+    echo "Firewall verification passed - blocked $label"
+}
+
+verify_allowed() {
+    local url="$1"
+    local label="$2"
+
+    if ! curl --connect-timeout 5 --max-time 8 "$url" >/dev/null 2>&1; then
+        echo "ERROR: Firewall verification failed - unable to reach $label" >&2
+        exit 1
+    fi
+    echo "Firewall verification passed - reached $label"
+}
+
+revoke_firewall_sudo() {
+    if [ "$KEEP_SUDO" = "1" ]; then
+        echo "Keeping passwordless firewall sudo permission"
+        return
+    fi
+
+    if [ -f /etc/sudoers.d/agent-firewall ]; then
+        rm -f /etc/sudoers.d/agent-firewall
+        echo "Revoked passwordless firewall sudo permission"
+    fi
+}
+
+DOCKER_DNS_RULES=$(iptables-save -t nat | grep "127\.0\.0\.11" || true)
+
+reset_ipv4_firewall
+drop_ipv6_firewall
+restore_docker_dns_rules "$DOCKER_DNS_RULES"
+
+ipset create "$ALLOWED_SET" hash:net family inet maxelem 65536
+
+allow_base_ipv4_traffic
+add_github_ranges
+add_allowed_domains
+allow_host_gateway_if_requested
+apply_default_denies
 
 echo "Firewall configuration complete"
 echo "Verifying firewall rules..."
-if curl --connect-timeout 5 https://example.com >/dev/null 2>&1; then
-    echo "ERROR: Firewall verification failed - was able to reach https://example.com"
-    exit 1
-else
-    echo "Firewall verification passed - unable to reach https://example.com as expected"
-fi
-
-# Verify GitHub API access
-if ! curl --connect-timeout 5 https://api.github.com/zen >/dev/null 2>&1; then
-    echo "ERROR: Firewall verification failed - unable to reach https://api.github.com"
-    exit 1
-else
-    echo "Firewall verification passed - able to reach https://api.github.com as expected"
-fi
+verify_blocked "https://example.com" "https://example.com"
+verify_allowed "https://api.github.com/zen" "https://api.github.com"
+verify_allowed "https://pypi.org/simple/pip/" "https://pypi.org"
+revoke_firewall_sudo

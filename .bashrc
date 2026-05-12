@@ -6,10 +6,12 @@ export HISTFILE=/commandhistory/.bash_history
 export NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 
 # PATH additions
-export PATH="$HOME/.local/bin:/usr/local/share/npm-global/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.venv/bin:/usr/local/share/npm-global/bin:$PATH"
 
 # UV project environment
 export UV_PROJECT_ENVIRONMENT="$HOME/.venv"
+export UV_CACHE_DIR="$HOME/.cache/uv"
+export UV_LINK_MODE=copy
 
 # Default editor
 export EDITOR=nano
@@ -23,5 +25,5 @@ alias codex="codex --dangerously-bypass-approvals-and-sandbox --search"
 
 # Activate virtual environment if present
 if [ -f "$UV_PROJECT_ENVIRONMENT/bin/activate" ]; then
-    source  $UV_PROJECT_ENVIRONMENT/bin/activate
+    source "$UV_PROJECT_ENVIRONMENT/bin/activate"
 fi
