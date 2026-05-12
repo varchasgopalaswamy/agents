@@ -19,9 +19,9 @@ export VISUAL=nano
 alias claude="claude --dangerously-skip-permissions"
 alias gemini="gemini --approval-mode=yolo"
 alias opencode="opencode"
-alias codex="codex --approval-mode=full-auto"
+alias codex="codex --dangerously-bypass-approvals-and-sandbox --search"
 
 # Activate virtual environment if present
-if [ -f ".claude_venv/bin/activate" ]; then
-    source .claude_venv/bin/activate
+if [ -f "$UV_PROJECT_ENVIRONMENT/bin/activate" ]; then
+    source  $UV_PROJECT_ENVIRONMENT/bin/activate
 fi
