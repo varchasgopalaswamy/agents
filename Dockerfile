@@ -98,17 +98,22 @@ ENV PATH=/home/agent/.local/bin:/home/agent/.venv/bin:/usr/local/share/npm-globa
 ENV EDITOR=nano
 ENV VISUAL=nano
 
-RUN (curl -fsSL https://claude.ai/install.sh | bash) && (npm install -g @google/gemini-cli @openai/codex @githubnext/github-copilot-cli opencode-ai) 
+RUN (curl -fsSL https://claude.ai/install.sh | bash) && (npm install -g @google/gemini-cli @openai/codex @githubnext/github-copilot-cli opencode-ai)
 
 # Copy and set up firewall script
-COPY init-firewall.sh /usr/local/bin/
+COPY init-firewall.sh configure-sudo-password.sh revoke-bootstrap-sudo.sh /usr/local/bin/
 USER root
-RUN chmod +x /usr/local/bin/init-firewall.sh && \
+RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/configure-sudo-password.sh /usr/local/bin/revoke-bootstrap-sudo.sh && \
   printf '%s\n' \
     'Defaults!/usr/local/bin/init-firewall.sh secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
     'agent ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh' \
     > /etc/sudoers.d/agent-firewall && \
-  chmod 0440 /etc/sudoers.d/agent-firewall
+  printf '%s\n' \
+    'Defaults!/usr/local/bin/configure-sudo-password.sh secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+    'Defaults!/usr/local/bin/revoke-bootstrap-sudo.sh secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+    'agent ALL=(root) NOPASSWD: /usr/local/bin/configure-sudo-password.sh, /usr/local/bin/revoke-bootstrap-sudo.sh' \
+    > /etc/sudoers.d/agent-sudo-bootstrap && \
+  chmod 0440 /etc/sudoers.d/agent-firewall /etc/sudoers.d/agent-sudo-bootstrap
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 

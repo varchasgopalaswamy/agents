@@ -50,6 +50,47 @@ ALLOWED_DOMAINS=(
     "www.googleapis.com"
 )
 
+split_config_list() {
+    local raw="${1:-}"
+    raw="${raw//$'\r'/,}"
+    raw="${raw//$'\n'/,}"
+    raw="${raw//$'\t'/,}"
+    raw="${raw// /,}"
+
+    local items=()
+    IFS=',' read -r -a items <<< "$raw"
+    printf '%s\n' "${items[@]}"
+}
+
+normalize_domain() {
+    local domain="$1"
+    domain="${domain#http://}"
+    domain="${domain#https://}"
+    domain="${domain%%/*}"
+    domain="${domain%%:*}"
+    domain="${domain%.}"
+    domain="${domain,,}"
+    printf '%s' "$domain"
+}
+
+append_configured_domains() {
+    if [ -z "${AGENTS_ALLOWED_DOMAINS:-}" ]; then
+        return
+    fi
+
+    while read -r configured_domain; do
+        [ -n "$configured_domain" ] || continue
+        local domain
+        domain=$(normalize_domain "$configured_domain")
+        if [[ ! "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || [[ "$domain" != *.* ]]; then
+            echo "ERROR: Invalid configured allowed domain: $configured_domain" >&2
+            exit 1
+        fi
+        echo "Adding configured allowed domain $domain"
+        ALLOWED_DOMAINS+=("$domain")
+    done < <(split_config_list "$AGENTS_ALLOWED_DOMAINS")
+}
+
 is_ipv4() {
     [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
 }
@@ -169,6 +210,27 @@ add_allowed_domain() {
     done < <(echo "$ips")
 }
 
+add_allowed_network() {
+    local network="$1"
+    if ! is_ipv4 "$network" && ! is_ipv4_cidr "$network"; then
+        echo "ERROR: Invalid configured allowed CIDR/IP: $network" >&2
+        exit 1
+    fi
+    echo "Adding configured allowed network $network"
+    ipset -exist add "$ALLOWED_SET" "$network"
+}
+
+add_configured_cidrs() {
+    if [ -z "${AGENTS_ALLOWED_CIDRS:-}" ]; then
+        return
+    fi
+
+    while read -r configured_network; do
+        [ -n "$configured_network" ] || continue
+        add_allowed_network "$configured_network"
+    done < <(split_config_list "$AGENTS_ALLOWED_CIDRS")
+}
+
 add_allowed_domains() {
     for domain in "${ALLOWED_DOMAINS[@]}"; do
         echo "Resolving $domain..."
@@ -247,6 +309,8 @@ ipset create "$ALLOWED_SET" hash:net family inet maxelem 65536
 
 allow_base_ipv4_traffic
 add_github_ranges
+add_configured_cidrs
+append_configured_domains
 add_allowed_domains
 allow_host_gateway_if_requested
 apply_default_denies

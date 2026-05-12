@@ -1,56 +1,432 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["configargparse==1.7.5"]
+# ///
 """
-start-agents — launch the agents container with podman or docker.
+start-agents - launch the agents container with podman or docker.
 
 Install:
   cp start-agents ~/.local/bin/start-agents
   chmod +x ~/.local/bin/start-agents
 
 Usage:
-  start-agents [IMAGE] [EXTRA_ARGS...]
-
-  IMAGE        Container image to run (default: ghcr.io/varchasgopalaswamy/agents:latest)
-  EXTRA_ARGS   Any additional arguments forwarded to podman/docker run
-
-Environment variables honored at launch time (passed into the container):
-  ANTHROPIC_API_KEY, CLAUDE_API_KEY
-  GOOGLE_API_KEY, GEMINI_API_KEY
-  OPENAI_API_KEY
-  GITHUB_TOKEN, GH_TOKEN
-  AGENTS_DISABLE_FIREWALL, AGENTS_ALLOW_HOST_NETWORK, AGENTS_KEEP_FIREWALL_SUDO
-  TZ  (defaults to the host timezone if /etc/localtime is available)
-
-Launcher-only override:
-  AGENTS_ALLOW_UNSAFE_FLAGS=1
+  start-agents [LAUNCHER_OPTIONS] [IMAGE] [DOCKER_OR_PODMAN_RUN_ARGS...]
+  start-agents --config CONFIG.toml [LAUNCHER_OPTIONS] [IMAGE] [DOCKER_OR_PODMAN_RUN_ARGS...]
 """
 
 from __future__ import annotations
 
+import argparse
+from collections import OrderedDict
+from dataclasses import dataclass, field
 import os
+from pathlib import Path
+import shlex
 import shutil
 import sys
-from pathlib import Path
+
+try:
+    import configargparse
+except ModuleNotFoundError as error:  # pragma: no cover - handled by uv script mode
+    raise SystemExit(
+        "ERROR: configargparse is required. Run this script with uv, or install "
+        "configargparse into the host Python environment."
+    ) from error
 
 DEFAULT_IMAGE = "ghcr.io/varchasgopalaswamy/agents:latest"
+DEFAULT_CONTAINER_VENV_DIR = "/home/agent/.venv"
+DEFAULT_CONTAINER_UV_CACHE_DIR = "/home/agent/.cache/uv"
 UNSAFE_OVERRIDE_ENV = "AGENTS_ALLOW_UNSAFE_FLAGS"
+CONFIG_SECTIONS = (
+    "start-agents",
+    "start-agents.paths",
+    "start-agents.python",
+    "start-agents.firewall",
+    "start-agents.sudo",
+)
+GROUP_TABLE_KEYS = {"firewall", "paths", "python", "sudo"}
+
+FORWARDED_SECRET_ENV_NAMES = (
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+)
+
+
+class ArgumentError(ValueError):
+    pass
 
 
 class UnsafeRunArg(ValueError):
     pass
 
 
-def resolve_runtime() -> str:
-    for runtime in ("podman", "docker"):
-        if shutil.which(runtime):
+class StartAgentsTomlConfigParser(configargparse.TomlConfigParser):
+    def parse(self, stream):
+        items = super().parse(stream)
+        filtered = OrderedDict()
+        for key, value in items.items():
+            if key in GROUP_TABLE_KEYS and isinstance(value, str) and value.startswith("{"):
+                continue
+            filtered[key] = value
+        return filtered
+
+
+@dataclass
+class LauncherConfig:
+    image: str = DEFAULT_IMAGE
+    extra_args: list[str] = field(default_factory=list)
+    runtime: str | None = None
+    workspace: Path = field(default_factory=Path.cwd)
+    command_history_dir: Path = field(
+        default_factory=lambda: Path.home() / ".local" / "share" / "agents" / "commandhistory"
+    )
+    claude_dir: Path = field(default_factory=lambda: Path.home() / ".claude")
+    claude_json: Path = field(default_factory=lambda: Path.home() / ".claude.json")
+    gemini_dir: Path = field(default_factory=lambda: Path.home() / ".gemini")
+    codex_dir: Path = field(default_factory=lambda: Path.home() / ".codex")
+    venv_dir: Path = field(default_factory=lambda: Path.home() / ".agents_venv")
+    uv_cache_dir: Path = field(default_factory=lambda: Path.home() / ".cache" / "uv")
+    container_venv_dir: str = DEFAULT_CONTAINER_VENV_DIR
+    container_uv_cache_dir: str = DEFAULT_CONTAINER_UV_CACHE_DIR
+    python_version: str | None = None
+    allowed_domains: list[str] = field(default_factory=list)
+    allowed_cidrs: list[str] = field(default_factory=list)
+    mount_agent_config: bool = True
+    disable_firewall: bool = False
+    allow_host_network: bool = False
+    keep_firewall_sudo: bool = False
+    enable_sudo_password: bool = False
+    recreate_venv: bool = False
+    dry_run: bool = False
+    tty: bool = True
+    container_name: str | None = None
+    timezone: str | None = None
+
+
+def build_arg_parser() -> configargparse.ArgParser:
+    parser = configargparse.ArgParser(
+        prog="start-agents",
+        description="Launch the agents container with podman or docker.",
+        epilog=(
+            "Launcher options must come before IMAGE. Unknown options are passed "
+            "to docker/podman run and dangerous runtime options are refused unless "
+            f"{UNSAFE_OVERRIDE_ENV}=1 is set. TOML config files use the "
+            "[start-agents] section."
+        ),
+        config_file_parser_class=StartAgentsTomlConfigParser(CONFIG_SECTIONS),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        allow_abbrev=False,
+    )
+
+    parser.add(
+        "-c",
+        "--config",
+        is_config_file=True,
+        env_var="AGENTS_CONFIG",
+        help="read options from a TOML file",
+    )
+    parser.add(
+        "--image",
+        dest="image_option",
+        env_var="AGENTS_IMAGE",
+        help="container image to run",
+    )
+
+    launcher_group = parser.add_argument_group("launcher options")
+    launcher_group.add(
+        "--runtime",
+        choices=("docker", "podman"),
+        env_var="AGENTS_RUNTIME",
+        help="choose a container runtime",
+    )
+    launcher_group.add(
+        "--workspace",
+        type=expand_path,
+        env_var="AGENTS_WORKSPACE",
+        help="host project directory mounted at /workspace",
+    )
+    launcher_group.add(
+        "--name",
+        "--container-name",
+        dest="container_name",
+        env_var="AGENTS_CONTAINER_NAME",
+        help="set the container name",
+    )
+    launcher_group.add(
+        "--dry-run",
+        action="store_true",
+        env_var="AGENTS_DRY_RUN",
+        help="print the run command instead of executing it",
+    )
+    launcher_group.add(
+        "--tty",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        env_var="AGENTS_TTY",
+        help="allocate an interactive TTY",
+    )
+    launcher_group.add("--timezone", env_var="TZ", help="container TZ value")
+
+    path_group = parser.add_argument_group("persistent path options")
+    path_group.add(
+        "--history-dir",
+        type=expand_path,
+        env_var="AGENTS_HISTORY_DIR",
+        help="host bash history directory",
+    )
+    path_group.add(
+        "--venv-dir",
+        type=expand_path,
+        env_var="AGENTS_VENV_DIR",
+        help="host Python venv directory",
+    )
+    path_group.add(
+        "--container-venv-dir",
+        type=validate_container_path,
+        env_var="AGENTS_CONTAINER_VENV_DIR",
+        help="container Python venv path",
+    )
+    path_group.add(
+        "--uv-cache-dir",
+        type=expand_path,
+        env_var="AGENTS_UV_CACHE_DIR",
+        help="host uv cache directory",
+    )
+    path_group.add(
+        "--container-uv-cache-dir",
+        type=validate_container_path,
+        env_var="AGENTS_CONTAINER_UV_CACHE_DIR",
+        help="container uv cache path",
+    )
+    path_group.add(
+        "--claude-dir",
+        type=expand_path,
+        env_var="AGENTS_CLAUDE_DIR",
+        help="host Claude config directory",
+    )
+    path_group.add(
+        "--claude-json",
+        type=expand_path,
+        env_var="AGENTS_CLAUDE_JSON",
+        help="host Claude settings file",
+    )
+    path_group.add(
+        "--gemini-dir",
+        type=expand_path,
+        env_var="AGENTS_GEMINI_DIR",
+        help="host Gemini config directory",
+    )
+    path_group.add(
+        "--codex-dir",
+        type=expand_path,
+        env_var="AGENTS_CODEX_DIR",
+        help="host Codex config directory",
+    )
+    path_group.add(
+        "--mount-agent-config",
+        "--agent-config",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        env_var="AGENTS_MOUNT_AGENT_CONFIG",
+        help="mount Claude/Gemini/Codex config directories",
+    )
+
+    python_group = parser.add_argument_group("Python options")
+    python_group.add(
+        "--python",
+        "--python-version",
+        dest="python_version",
+        env_var="AGENTS_PYTHON_VERSION",
+        help="Python version passed to uv when creating the venv",
+    )
+    python_group.add(
+        "--recreate-venv",
+        action="store_true",
+        env_var="AGENTS_RECREATE_VENV",
+        help="delete and recreate the mounted venv on startup",
+    )
+
+    firewall_group = parser.add_argument_group("firewall options")
+    firewall_group.add(
+        "--allow-domain",
+        "--allowed-domain",
+        "--allow-domains",
+        "--allowed-domains",
+        dest="allowed_domains",
+        action="append",
+        default=[],
+        env_var="AGENTS_ALLOWED_DOMAINS",
+        help="add one or more outbound allowlist domains",
+    )
+    firewall_group.add(
+        "--allow-cidr",
+        "--allow-cidrs",
+        "--allowed-cidrs",
+        dest="allowed_cidrs",
+        action="append",
+        default=[],
+        env_var="AGENTS_ALLOWED_CIDRS",
+        help="add one or more outbound allowlist IPv4 CIDRs/IPs",
+    )
+    firewall_group.add(
+        "--disable-firewall",
+        "--no-firewall",
+        dest="disable_firewall",
+        action="store_true",
+        env_var="AGENTS_DISABLE_FIREWALL",
+        help="skip firewall initialization",
+    )
+    firewall_group.add(
+        "--allow-host-network",
+        action="store_true",
+        env_var="AGENTS_ALLOW_HOST_NETWORK",
+        help="allow outbound access to the host gateway",
+    )
+    firewall_group.add(
+        "--keep-firewall-sudo",
+        action="store_true",
+        env_var="AGENTS_KEEP_FIREWALL_SUDO",
+        help="keep the one-command firewall sudo rule after startup",
+    )
+
+    sudo_group = parser.add_argument_group("sudo")
+    sudo_group.add(
+        "--sudo",
+        "--enable-sudo",
+        dest="enable_sudo_password",
+        action="store_true",
+        env_var="AGENTS_ENABLE_SUDO_PASSWORD",
+        help="prompt inside the container to set an agent sudo password",
+    )
+
+    passthrough_group = parser.add_argument_group("passthrough options")
+    passthrough_group.add(
+        "--extra-arg",
+        "--extra-args",
+        dest="extra_args",
+        action="append",
+        default=[],
+        env_var="AGENTS_EXTRA_ARGS",
+        help="additional docker/podman run argument; repeatable or TOML list",
+    )
+
+    parser.add(
+        "tail",
+        nargs=argparse.REMAINDER,
+        metavar="IMAGE [DOCKER_OR_PODMAN_RUN_ARGS...]",
+        help="optional image followed by arguments passed to docker/podman run",
+    )
+    return parser
+
+
+def parse_launcher_args(argv: list[str]) -> LauncherConfig:
+    parser = build_arg_parser()
+    namespace, unknown_args = parser.parse_known_args(argv)
+
+    config = config_from_namespace(namespace)
+    tail = list(namespace.tail)
+    if tail and tail[0] == "--":
+        tail = tail[1:]
+
+    if unknown_args:
+        config.extra_args.extend([*unknown_args, *tail])
+    elif tail and not tail[0].startswith("-"):
+        config.image = tail[0]
+        config.extra_args.extend(tail[1:])
+    else:
+        config.extra_args.extend(tail)
+
+    if namespace.image_option and config.image == DEFAULT_IMAGE:
+        config.image = namespace.image_option
+
+    return config
+
+
+def config_from_namespace(namespace: argparse.Namespace) -> LauncherConfig:
+    config = LauncherConfig(
+        image=namespace.image_option or DEFAULT_IMAGE,
+        runtime=namespace.runtime,
+        workspace=namespace.workspace or Path.cwd(),
+        command_history_dir=(
+            namespace.history_dir or Path.home() / ".local" / "share" / "agents" / "commandhistory"
+        ),
+        claude_dir=namespace.claude_dir or Path.home() / ".claude",
+        claude_json=namespace.claude_json or Path.home() / ".claude.json",
+        gemini_dir=namespace.gemini_dir or Path.home() / ".gemini",
+        codex_dir=namespace.codex_dir or Path.home() / ".codex",
+        venv_dir=namespace.venv_dir or Path.home() / ".agents_venv",
+        uv_cache_dir=namespace.uv_cache_dir or Path.home() / ".cache" / "uv",
+        container_venv_dir=namespace.container_venv_dir or DEFAULT_CONTAINER_VENV_DIR,
+        container_uv_cache_dir=namespace.container_uv_cache_dir or DEFAULT_CONTAINER_UV_CACHE_DIR,
+        python_version=namespace.python_version,
+        allowed_domains=flatten_list_values(namespace.allowed_domains),
+        allowed_cidrs=flatten_list_values(namespace.allowed_cidrs),
+        mount_agent_config=namespace.mount_agent_config,
+        disable_firewall=namespace.disable_firewall,
+        allow_host_network=namespace.allow_host_network,
+        keep_firewall_sudo=namespace.keep_firewall_sudo,
+        enable_sudo_password=namespace.enable_sudo_password,
+        recreate_venv=namespace.recreate_venv,
+        dry_run=namespace.dry_run,
+        tty=namespace.tty,
+        container_name=namespace.container_name,
+        timezone=namespace.timezone,
+        extra_args=flatten_extra_args(namespace.extra_args),
+    )
+    return config
+
+
+def expand_path(value: str) -> Path:
+    return Path(value).expanduser().resolve(strict=False)
+
+
+def validate_container_path(value: str) -> str:
+    if not value.startswith("/"):
+        raise argparse.ArgumentTypeError("must be an absolute container path")
+    normalized = value.rstrip("/") or "/"
+    if normalized == "/":
+        raise argparse.ArgumentTypeError("cannot be /")
+    return normalized
+
+
+def flatten_list_values(values: list[str] | None) -> list[str]:
+    items: list[str] = []
+    for value in values or []:
+        for chunk in value.replace(",", " ").split():
+            if chunk:
+                items.append(chunk)
+    return items
+
+
+def flatten_extra_args(values: list[str] | None) -> list[str]:
+    args: list[str] = []
+    for value in values or []:
+        if isinstance(value, str):
+            args.extend(shlex.split(value))
+        else:
+            args.append(value)
+    return args
+
+
+def resolve_runtime(preferred: str | None = None, allow_missing: bool = False) -> str:
+    candidates = (preferred,) if preferred else ("podman", "docker")
+    for runtime in candidates:
+        if runtime and shutil.which(runtime):
             return runtime
-    print("ERROR: neither podman nor docker found on PATH", file=sys.stderr)
+    if allow_missing:
+        return preferred or "podman"
+    if preferred:
+        print(f"ERROR: requested runtime not found on PATH: {preferred}", file=sys.stderr)
+    else:
+        print("ERROR: neither podman nor docker found on PATH", file=sys.stderr)
     sys.exit(1)
-
-
-def resolve_image_and_extra_args(argv: list[str]) -> tuple[str, list[str]]:
-    if argv and not argv[0].startswith("-"):
-        return argv[0], argv[1:]
-    return DEFAULT_IMAGE, argv
 
 
 def reject_unsafe_extra_args(extra_args: list[str]) -> None:
@@ -184,91 +560,165 @@ def ensure_timezone_env() -> None:
         os.environ["TZ"] = resolved_str.split(marker, 1)[1]
 
 
-def ensure_host_paths() -> dict[str, Path]:
-    home = Path.home()
-    paths = {
-        "command_history_dir": home / ".local" / "share" / "agents" / "commandhistory",
-        "claude_dir": home / ".claude",
-        "claude_json": home / ".claude.json",
-        "gemini_dir": home / ".gemini",
-        "codex_dir": home / ".codex",
-        "venv_dir": home / ".agents_venv",
-        "uv_cache_dir": home / ".cache" / "uv",
-    }
+def ensure_host_paths(config: LauncherConfig) -> None:
+    validate_workspace(config)
 
-    for key in ("command_history_dir", "claude_dir", "gemini_dir", "codex_dir", "venv_dir", "uv_cache_dir"):
-        paths[key].mkdir(parents=True, exist_ok=True)
-    paths["claude_json"].touch(exist_ok=True)
-    return paths
+    for path in (
+        config.command_history_dir,
+        config.venv_dir,
+        config.uv_cache_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+    if config.mount_agent_config:
+        for path in (config.claude_dir, config.gemini_dir, config.codex_dir):
+            path.mkdir(parents=True, exist_ok=True)
+        config.claude_json.parent.mkdir(parents=True, exist_ok=True)
+        config.claude_json.touch(exist_ok=True)
 
 
-def build_mounts(paths: dict[str, Path]) -> list[str]:
-    workspace = Path.cwd()
-    return [
-        f"--volume={workspace}:/workspace:z",
-        f"--volume={paths['command_history_dir']}:/commandhistory:z",
-        f"--volume={paths['claude_dir']}:/home/agent/.claude:z",
-        f"--volume={paths['gemini_dir']}:/home/agent/.gemini:z",
-        f"--volume={paths['codex_dir']}:/home/agent/.codex:z",
-        f"--volume={paths['claude_json']}:/home/agent/.claude.json:z",
-        f"--volume={paths['venv_dir']}:/home/agent/.venv:z",
-        f"--volume={paths['uv_cache_dir']}:/home/agent/.cache/uv:z",
+def validate_workspace(config: LauncherConfig) -> None:
+    if not config.workspace.exists() or not config.workspace.is_dir():
+        raise ArgumentError(f"workspace must be an existing directory: {config.workspace}")
+
+
+def validate_config(config: LauncherConfig) -> None:
+    if config.enable_sudo_password and not config.tty:
+        raise ArgumentError("--sudo requires an interactive TTY; remove --no-tty")
+
+    if config.recreate_venv and is_dangerous_recreate_path(config.venv_dir, config.workspace):
+        raise ArgumentError(f"refusing to recreate unsafe venv host path: {config.venv_dir}")
+
+    if config.container_venv_dir in {"/home", "/home/agent"}:
+        raise ArgumentError(f"refusing unsafe container venv path: {config.container_venv_dir}")
+    if config.container_uv_cache_dir in {"/home", "/home/agent"}:
+        raise ArgumentError(f"refusing unsafe container uv cache path: {config.container_uv_cache_dir}")
+
+
+def is_dangerous_recreate_path(path: Path, workspace: Path) -> bool:
+    resolved = path.resolve(strict=False)
+    home = Path.home().resolve(strict=False)
+    workspace_resolved = workspace.resolve(strict=False)
+    return resolved in {Path("/"), home, workspace_resolved}
+
+
+def build_mounts(config: LauncherConfig) -> list[str]:
+    mounts = [
+        volume_arg(config.workspace, "/workspace", "z"),
+        volume_arg(config.command_history_dir, "/commandhistory", "z"),
+        volume_arg(config.venv_dir, config.container_venv_dir, "z"),
+        volume_arg(config.uv_cache_dir, config.container_uv_cache_dir, "z"),
     ]
 
+    if config.mount_agent_config:
+        mounts.extend(
+            [
+                volume_arg(config.claude_dir, "/home/agent/.claude", "z"),
+                volume_arg(config.gemini_dir, "/home/agent/.gemini", "z"),
+                volume_arg(config.codex_dir, "/home/agent/.codex", "z"),
+                volume_arg(config.claude_json, "/home/agent/.claude.json", "z"),
+            ]
+        )
+    return mounts
 
-def build_env_args() -> list[str]:
+
+def volume_arg(host_path: Path, container_path: str, options: str) -> str:
+    return f"--volume={host_path}:{container_path}:{options}"
+
+
+def build_env_args(config: LauncherConfig) -> list[str]:
+    explicit_env = build_explicit_env(config)
     env_args: list[str] = []
-    for name in (
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_API_KEY",
-        "GOOGLE_API_KEY",
-        "GEMINI_API_KEY",
-        "OPENAI_API_KEY",
-        "GITHUB_TOKEN",
-        "GH_TOKEN",
-        "AGENTS_DISABLE_FIREWALL",
-        "AGENTS_ALLOW_HOST_NETWORK",
-        "AGENTS_KEEP_FIREWALL_SUDO",
-        "TZ",
-    ):
+
+    for name in FORWARDED_SECRET_ENV_NAMES:
+        if name in explicit_env:
+            continue
         if os.environ.get(name):
             env_args.append(f"--env={name}")
+
+    for name, value in explicit_env.items():
+        env_args.append(f"--env={name}={value}")
     return env_args
 
 
+def build_explicit_env(config: LauncherConfig) -> dict[str, str]:
+    env = {
+        "UV_PROJECT_ENVIRONMENT": config.container_venv_dir,
+        "UV_CACHE_DIR": config.container_uv_cache_dir,
+        "UV_LINK_MODE": "copy",
+    }
+
+    if config.python_version:
+        env["AGENTS_PYTHON_VERSION"] = config.python_version
+    if config.allowed_domains:
+        env["AGENTS_ALLOWED_DOMAINS"] = ",".join(config.allowed_domains)
+    if config.allowed_cidrs:
+        env["AGENTS_ALLOWED_CIDRS"] = ",".join(config.allowed_cidrs)
+    if config.disable_firewall:
+        env["AGENTS_DISABLE_FIREWALL"] = "1"
+    if config.allow_host_network:
+        env["AGENTS_ALLOW_HOST_NETWORK"] = "1"
+    if config.keep_firewall_sudo:
+        env["AGENTS_KEEP_FIREWALL_SUDO"] = "1"
+    if config.enable_sudo_password:
+        env["AGENTS_ENABLE_SUDO_PASSWORD"] = "1"
+    if config.recreate_venv:
+        env["AGENTS_RECREATE_VENV"] = "1"
+    if config.timezone:
+        env["TZ"] = config.timezone
+
+    return env
+
+
+def build_run_command(runtime: str, config: LauncherConfig) -> list[str]:
+    command = [runtime, "run", "--rm"]
+    if config.tty:
+        command.extend(["--interactive", "--tty"])
+    if config.container_name:
+        command.append(f"--name={config.container_name}")
+
+    command.extend(
+        [
+            # NET_ADMIN and NET_RAW are required by init-firewall.sh, which uses
+            # iptables/ipset to restrict outbound traffic to an allowlist.
+            "--cap-add=NET_ADMIN",
+            "--cap-add=NET_RAW",
+            *build_mounts(config),
+            *build_env_args(config),
+            *config.extra_args,
+            config.image,
+        ]
+    )
+    return command
+
+
 def main() -> None:
-    image, extra_args = resolve_image_and_extra_args(sys.argv[1:])
     try:
-        reject_unsafe_extra_args(extra_args)
-    except UnsafeRunArg as error:
+        config = parse_launcher_args(sys.argv[1:])
+        reject_unsafe_extra_args(config.extra_args)
+        validate_config(config)
+        ensure_timezone_env()
+        if config.dry_run:
+            validate_workspace(config)
+        else:
+            ensure_host_paths(config)
+    except (ArgumentError, UnsafeRunArg) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         sys.exit(2)
 
-    runtime = resolve_runtime()
-    ensure_timezone_env()
-
-    mounts = build_mounts(ensure_host_paths())
-    env_args = build_env_args()
+    runtime = resolve_runtime(config.runtime, allow_missing=config.dry_run)
+    command = build_run_command(runtime, config)
 
     print(f"Starting agents container with {runtime}...")
-    print(f"  Image    : {image}")
-    print(f"  Workspace: {Path.cwd()}")
+    print(f"  Image    : {config.image}")
+    print(f"  Workspace: {config.workspace}")
+    if config.enable_sudo_password:
+        print("  Sudo     : password setup prompt will run inside the container TTY")
 
-    command = [
-        runtime,
-        "run",
-        "--rm",
-        "--interactive",
-        "--tty",
-        # NET_ADMIN and NET_RAW are required by init-firewall.sh, which uses
-        # iptables/ipset to restrict outbound traffic to an allowlist of domains.
-        "--cap-add=NET_ADMIN",
-        "--cap-add=NET_RAW",
-        *mounts,
-        *env_args,
-        *extra_args,
-        image,
-    ]
+    if config.dry_run:
+        print(shlex.join(command))
+        return
+
     os.execvp(runtime, command)
 
 
