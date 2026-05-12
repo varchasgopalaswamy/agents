@@ -3,15 +3,11 @@ set -euo pipefail
 IFS=$'\n\t'
 
 ALLOW_HOST_NETWORK=0
-KEEP_SUDO=0
 
 for arg in "$@"; do
     case "$arg" in
         --allow-host-network)
             ALLOW_HOST_NETWORK=1
-            ;;
-        --keep-sudo)
-            KEEP_SUDO=1
             ;;
         *)
             echo "ERROR: unknown firewall option: $arg" >&2
@@ -25,7 +21,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-ALLOWED_SET="allowed-domains"
+ALLOWED_NETWORKS=()
 ALLOWED_DOMAINS=(
     "accounts.google.com"
     "api.anthropic.com"
@@ -38,12 +34,17 @@ ALLOWED_DOMAINS=(
     "copilot-proxy.githubusercontent.com"
     "files.pythonhosted.org"
     "generativelanguage.googleapis.com"
+    "api.github.com"
+    "codeload.github.com"
+    "github.com"
+    "github-releases.githubusercontent.com"
+    "gist.githubusercontent.com"
     "marketplace.visualstudio.com"
     "oauth2.googleapis.com"
+    "objects.githubusercontent.com"
     "pypi.org"
+    "raw.githubusercontent.com"
     "registry.npmjs.org"
-    "sentry.io"
-    "statsig.com"
     "update.code.visualstudio.com"
     "vscode.blob.core.windows.net"
     "www.googleapis.com"
@@ -112,7 +113,6 @@ reset_ipv4_firewall() {
     iptables -t nat -X
     iptables -t mangle -F
     iptables -t mangle -X
-    ipset destroy "$ALLOWED_SET" 2>/dev/null || true
 }
 
 drop_ipv6_firewall() {
@@ -154,18 +154,12 @@ restore_docker_dns_rules() {
 }
 
 allow_base_ipv4_traffic() {
+    iptables -A OUTPUT -p udp --dport 53 -j REJECT
+    iptables -A OUTPUT -p tcp --dport 53 -j REJECT --reject-with tcp-reset 2>/dev/null || iptables -A OUTPUT -p tcp --dport 53 -j REJECT
     iptables -A INPUT -i lo -j ACCEPT
     iptables -A OUTPUT -o lo -j ACCEPT
     iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
     iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-    while read -r resolver; do
-        if is_ipv4 "$resolver"; then
-            echo "Allowing DNS resolver $resolver"
-            iptables -A OUTPUT -p udp -d "$resolver" --dport 53 -j ACCEPT
-            iptables -A OUTPUT -p tcp -d "$resolver" --dport 53 -j ACCEPT
-        fi
-    done < <(awk '/^nameserver / {print $2}' /etc/resolv.conf)
 }
 
 add_github_ranges() {
@@ -185,7 +179,7 @@ add_github_ranges() {
             exit 1
         fi
         echo "Adding GitHub range $cidr"
-        ipset -exist add "$ALLOWED_SET" "$cidr"
+        ALLOWED_NETWORKS+=("$cidr")
     done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git + (.packages // []))[]' | aggregate -q)
 }
 
@@ -205,7 +199,8 @@ add_allowed_domain() {
             exit 1
         fi
         echo "Adding $ip for $domain"
-        ipset -exist add "$ALLOWED_SET" "$ip"
+        ALLOWED_NETWORKS+=("$ip")
+        printf '%s\t%s\n' "$ip" "$domain" >> /etc/hosts
     done < <(echo "$ips")
 }
 
@@ -216,7 +211,7 @@ add_allowed_network() {
         exit 1
     fi
     echo "Adding configured allowed network $network"
-    ipset -exist add "$ALLOWED_SET" "$network"
+    ALLOWED_NETWORKS+=("$network")
 }
 
 add_configured_cidrs() {
@@ -260,7 +255,9 @@ apply_default_denies() {
     iptables -P FORWARD DROP
     iptables -P OUTPUT DROP
 
-    iptables -A OUTPUT -m set --match-set "$ALLOWED_SET" dst -j ACCEPT
+    for network in "${ALLOWED_NETWORKS[@]}"; do
+        iptables -A OUTPUT -d "$network" -j ACCEPT
+    done
     iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
 }
 
@@ -287,11 +284,6 @@ verify_allowed() {
 }
 
 revoke_firewall_sudo() {
-    if [ "$KEEP_SUDO" = "1" ]; then
-        echo "Keeping passwordless firewall sudo permission"
-        return
-    fi
-
     if [ -f /etc/sudoers.d/agent-firewall ]; then
         rm -f /etc/sudoers.d/agent-firewall
         echo "Revoked passwordless firewall sudo permission"
@@ -304,13 +296,11 @@ reset_ipv4_firewall
 drop_ipv6_firewall
 restore_docker_dns_rules "$DOCKER_DNS_RULES"
 
-ipset create "$ALLOWED_SET" hash:net family inet maxelem 65536
-
-allow_base_ipv4_traffic
 add_github_ranges
 add_configured_cidrs
 append_configured_domains
 add_allowed_domains
+allow_base_ipv4_traffic
 allow_host_gateway_if_requested
 apply_default_denies
 

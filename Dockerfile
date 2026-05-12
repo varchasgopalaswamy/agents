@@ -12,7 +12,7 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Install development tools, Python, and iptables/ipset.
+# Install development tools, Python, and iptables.
 RUN apt-get update && apt-get install -y --no-install-recommends \
   aggregate \
   bat \
@@ -23,9 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   fzf \
   gh \
   git \
+  gosu \
   gnupg2 \
   iproute2 \
-  ipset \
   iptables \
   jq \
   krb5-user \
@@ -100,20 +100,10 @@ ENV VISUAL=nano
 
 RUN (curl -fsSL https://claude.ai/install.sh | bash) && (npm install -g @google/gemini-cli @openai/codex @githubnext/github-copilot-cli opencode-ai)
 
-# Copy and set up firewall script
+# Copy and set up startup helper scripts.
 COPY init-firewall.sh configure-sudo-password.sh revoke-bootstrap-sudo.sh /usr/local/bin/
 USER root
-RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/configure-sudo-password.sh /usr/local/bin/revoke-bootstrap-sudo.sh && \
-  printf '%s\n' \
-    'Defaults!/usr/local/bin/init-firewall.sh secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
-    'agent ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh' \
-    > /etc/sudoers.d/agent-firewall && \
-  printf '%s\n' \
-    'Defaults!/usr/local/bin/configure-sudo-password.sh secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
-    'Defaults!/usr/local/bin/revoke-bootstrap-sudo.sh secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
-    'agent ALL=(root) NOPASSWD: /usr/local/bin/configure-sudo-password.sh, /usr/local/bin/revoke-bootstrap-sudo.sh' \
-    > /etc/sudoers.d/agent-sudo-bootstrap && \
-  chmod 0440 /etc/sudoers.d/agent-firewall /etc/sudoers.d/agent-sudo-bootstrap
+RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/configure-sudo-password.sh /usr/local/bin/revoke-bootstrap-sudo.sh
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
@@ -125,7 +115,7 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Make sure the script is executable
 RUN chmod +x /usr/local/bin/entrypoint.sh
-USER agent
+USER root
 
 # Set the entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

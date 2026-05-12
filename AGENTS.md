@@ -37,4 +37,4 @@ Pull requests should include a brief summary, validation commands run, and any D
 
 ## Security & Configuration Tips
 
-Do not commit API keys or host-specific credentials. The launcher forwards supported credentials from environment variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, and `GH_TOKEN`. Changes to `init-firewall.sh` should document new allowed domains and preserve explicit verification of blocked and allowed traffic.
+Do not commit API keys or host-specific credentials. The launcher only forwards supported credential environment variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, and `GH_TOKEN` when secret forwarding is explicitly enabled. Changes to `init-firewall.sh` should document new allowed domains and preserve explicit verification of blocked and allowed traffic.

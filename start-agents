@@ -95,13 +95,15 @@ class LauncherConfig:
     uv_cache_dir: Path = field(default_factory=lambda: Path.home() / ".cache" / "uv")
     container_venv_dir: str = DEFAULT_CONTAINER_VENV_DIR
     container_uv_cache_dir: str = DEFAULT_CONTAINER_UV_CACHE_DIR
+    persist_python: bool = False
     python_version: str | None = None
     allowed_domains: list[str] = field(default_factory=list)
     allowed_cidrs: list[str] = field(default_factory=list)
-    mount_agent_config: bool = True
+    mount_agent_config: bool = False
+    writable_agent_config: bool = False
+    forward_secret_env: bool = False
     disable_firewall: bool = False
     allow_host_network: bool = False
-    keep_firewall_sudo: bool = False
     enable_sudo_password: bool = False
     recreate_venv: bool = False
     dry_run: bool = False
@@ -185,7 +187,7 @@ def build_arg_parser() -> configargparse.ArgParser:
         "--venv-dir",
         type=expand_path,
         env_var="AGENTS_VENV_DIR",
-        help="host Python venv directory",
+        help="host Python venv directory used when Python persistence is enabled",
     )
     path_group.add(
         "--container-venv-dir",
@@ -197,7 +199,7 @@ def build_arg_parser() -> configargparse.ArgParser:
         "--uv-cache-dir",
         type=expand_path,
         env_var="AGENTS_UV_CACHE_DIR",
-        help="host uv cache directory",
+        help="host uv cache directory used when Python persistence is enabled",
     )
     path_group.add(
         "--container-uv-cache-dir",
@@ -235,10 +237,24 @@ def build_arg_parser() -> configargparse.ArgParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         env_var="AGENTS_MOUNT_AGENT_CONFIG",
-        help="mount Claude/Gemini/Codex config directories",
+        help="mount Claude/Gemini/Codex config directories read-only",
+    )
+    path_group.add(
+        "--writable-agent-config",
+        action="store_true",
+        default=False,
+        env_var="AGENTS_WRITABLE_AGENT_CONFIG",
+        help="mount agent config directories read/write; exposes host credentials to modification",
     )
 
     python_group = parser.add_argument_group("Python options")
+    python_group.add(
+        "--persist-python",
+        action="store_true",
+        default=False,
+        env_var="AGENTS_PERSIST_PYTHON",
+        help="mount the Python venv and uv cache from the host for reuse across sessions",
+    )
     python_group.add(
         "--python",
         "--python-version",
@@ -289,13 +305,6 @@ def build_arg_parser() -> configargparse.ArgParser:
         env_var="AGENTS_ALLOW_HOST_NETWORK",
         help="allow outbound access to the host gateway",
     )
-    firewall_group.add(
-        "--keep-firewall-sudo",
-        action="store_true",
-        env_var="AGENTS_KEEP_FIREWALL_SUDO",
-        help="keep the one-command firewall sudo rule after startup",
-    )
-
     sudo_group = parser.add_argument_group("sudo")
     sudo_group.add(
         "--sudo",
@@ -304,6 +313,15 @@ def build_arg_parser() -> configargparse.ArgParser:
         action="store_true",
         env_var="AGENTS_ENABLE_SUDO_PASSWORD",
         help="prompt inside the container to set an agent sudo password",
+    )
+
+    secret_group = parser.add_argument_group("secret options")
+    secret_group.add(
+        "--forward-secret-env",
+        action="store_true",
+        default=False,
+        env_var="AGENTS_FORWARD_SECRET_ENV",
+        help="forward supported host API/token environment variables into the container",
     )
 
     passthrough_group = parser.add_argument_group("passthrough options")
@@ -365,13 +383,19 @@ def config_from_namespace(namespace: argparse.Namespace) -> LauncherConfig:
         uv_cache_dir=namespace.uv_cache_dir or Path.home() / ".cache" / "uv",
         container_venv_dir=namespace.container_venv_dir or DEFAULT_CONTAINER_VENV_DIR,
         container_uv_cache_dir=namespace.container_uv_cache_dir or DEFAULT_CONTAINER_UV_CACHE_DIR,
+        persist_python=(
+            namespace.persist_python
+            or namespace.venv_dir is not None
+            or namespace.uv_cache_dir is not None
+        ),
         python_version=namespace.python_version,
         allowed_domains=flatten_list_values(namespace.allowed_domains),
         allowed_cidrs=flatten_list_values(namespace.allowed_cidrs),
         mount_agent_config=namespace.mount_agent_config,
+        writable_agent_config=namespace.writable_agent_config,
+        forward_secret_env=namespace.forward_secret_env,
         disable_firewall=namespace.disable_firewall,
         allow_host_network=namespace.allow_host_network,
-        keep_firewall_sudo=namespace.keep_firewall_sudo,
         enable_sudo_password=namespace.enable_sudo_password,
         recreate_venv=namespace.recreate_venv,
         dry_run=namespace.dry_run,
@@ -429,6 +453,63 @@ def resolve_runtime(preferred: str | None = None, allow_missing: bool = False) -
     sys.exit(1)
 
 
+PROTECTED_PASSTHROUGH_ENV_NAMES = {
+    "AGENT_USER",
+    "BASH_ENV",
+    "ENV",
+    "HOME",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "USER",
+    "UV_CACHE_DIR",
+    "UV_LINK_MODE",
+    "UV_PROJECT_ENVIRONMENT",
+}
+PROTECTED_PASSTHROUGH_ENV_PREFIXES = ("AGENTS_",)
+
+REJECTED_VALUE_FLAGS = {
+    "--add-host": "host aliases can redirect trusted names or expose host services",
+    "--cap-add": "the launcher controls the container capability set",
+    "--cgroupns": "custom cgroup namespaces weaken runtime isolation",
+    "--device": "device passthrough can bypass the sandbox",
+    "--device-cgroup-rule": "device passthrough can bypass the sandbox",
+    "--dns": "custom DNS can bypass egress controls and enable DNS exfiltration",
+    "--dns-option": "custom DNS can bypass egress controls and enable DNS exfiltration",
+    "--dns-search": "custom DNS can bypass egress controls and enable DNS exfiltration",
+    "--entrypoint": "overriding the entrypoint bypasses Python and firewall initialization",
+    "--env-file": "env files can override launcher-controlled safety variables",
+    "--gpus": "GPU/device passthrough expands host device access",
+    "--group-add": "extra groups can expand access to mounted host files",
+    "--ipc": "custom IPC namespaces weaken process isolation",
+    "--mount": "extra mounts can expose or corrupt host files",
+    "--network": "the launcher controls networking so the firewall can enforce egress policy",
+    "--net": "the launcher controls networking so the firewall can enforce egress policy",
+    "--pid": "custom PID namespaces weaken process isolation",
+    "--pod": "joining an existing pod can bypass this container's network policy",
+    "--publish": "published ports expose container services outside the sandbox",
+    "--runtime": "custom low-level runtimes can change isolation guarantees",
+    "--security-opt": "the launcher controls runtime security options",
+    "--user": "the entrypoint must start as root, initialize safely, then drop to agent",
+    "--userns": "custom user namespaces weaken filesystem isolation assumptions",
+    "--uts": "custom UTS namespaces weaken runtime isolation",
+    "--volume": "extra volumes can expose or corrupt host files",
+    "-p": "published ports expose container services outside the sandbox",
+    "-u": "the entrypoint must start as root, initialize safely, then drop to agent",
+    "-v": "extra volumes can expose or corrupt host files",
+}
+
+REJECTED_BOOL_FLAGS = {
+    "--network-alias": "network aliases can confuse hostname-based policy",
+    "--privileged": "privileged mode disables the container isolation this launcher relies on",
+    "--publish-all": "published ports expose container services outside the sandbox",
+}
+
+ENV_FLAGS = {"--env", "-e"}
+
+
 def reject_unsafe_extra_args(extra_args: list[str]) -> None:
     if os.environ.get(UNSAFE_OVERRIDE_ENV) == "1":
         return
@@ -443,54 +524,34 @@ def reject_unsafe_extra_args(extra_args: list[str]) -> None:
             pending_flag = None
             continue
 
-        if arg == "--privileged":
-            violations.append("--privileged: disables the container isolation this launcher relies on")
+        short_reason = unsafe_short_arg_reason(arg)
+        if short_reason:
+            violations.append(f"{arg}: {short_reason}")
             continue
 
-        if arg in {
-            "--network",
-            "--net",
-            "--pid",
-            "--ipc",
-            "--uts",
-            "--userns",
-            "--cap-add",
-            "--security-opt",
-            "--user",
-            "-u",
-            "--entrypoint",
-            "-v",
-            "--volume",
-            "--mount",
-        }:
-            pending_flag = arg
-            continue
-
-        if arg == "--device" or arg.startswith("--device="):
-            violations.append(f"{arg}: device passthrough can bypass the sandbox")
-            continue
-
-        for prefix in (
-            "--network=",
-            "--net=",
-            "--pid=",
-            "--ipc=",
-            "--uts=",
-            "--userns=",
-            "--cap-add=",
-            "--security-opt=",
-            "--user=",
-            "--entrypoint=",
-            "--volume=",
-            "--mount=",
-        ):
-            if arg.startswith(prefix):
-                flag = prefix[:-1]
-                value = arg.removeprefix(prefix)
+        flag, value = split_inline_flag_value(arg)
+        if flag in ENV_FLAGS:
+            if value is None:
+                pending_flag = flag
+            else:
                 reason = unsafe_flag_value_reason(flag, value)
                 if reason:
                     violations.append(f"{arg}: {reason}")
-                break
+            continue
+
+        if flag in REJECTED_BOOL_FLAGS:
+            violations.append(f"{arg}: {REJECTED_BOOL_FLAGS[flag]}")
+            continue
+
+        if flag in REJECTED_VALUE_FLAGS:
+            if value is None:
+                pending_flag = flag
+            else:
+                violations.append(f"{arg}: {unsafe_flag_value_reason(flag, value)}")
+            continue
+
+    if pending_flag:
+        violations.append(f"{pending_flag}: missing required value")
 
     if violations:
         formatted = "\n  ".join(violations)
@@ -502,49 +563,36 @@ def reject_unsafe_extra_args(extra_args: list[str]) -> None:
 
 
 def unsafe_flag_value_reason(flag: str, value: str) -> str | None:
-    if flag in {"--network", "--net"} and value == "host":
-        return "host networking would let the firewall script modify the host network namespace"
-    if flag in {"--pid", "--ipc", "--uts"} and value == "host":
-        return "sharing host namespaces weakens process and system isolation"
-    if flag == "--userns" and value == "host":
-        return "sharing the host user namespace weakens filesystem isolation"
-    if flag == "--cap-add" and value.upper() not in {"NET_ADMIN", "NET_RAW"}:
-        return "extra Linux capabilities are broader than the firewall needs"
-    if flag == "--security-opt" and value in {
-        "apparmor=unconfined",
-        "label=disable",
-        "no-new-privileges=false",
-        "seccomp=unconfined",
-    }:
-        return "this disables a runtime security boundary"
-    if flag in {"--user", "-u"} and any(part in {"0", "root"} for part in value.split(":")):
-        return "running the agent as root would let it alter the container firewall"
-    if flag == "--entrypoint":
-        return "overriding the entrypoint bypasses Python and firewall initialization"
-    if flag in {"-v", "--volume"}:
-        source = value.split(":", 1)[0]
-        if source == "/":
-            return "mounting the host root filesystem exposes the host"
-        if source in {"/var/run/docker.sock", "/run/docker.sock"}:
-            return "mounting the container runtime socket grants host-level control"
-    if flag == "--mount":
-        mount_options = parse_mount_options(value)
-        source = mount_options.get("source") or mount_options.get("src")
-        if source == "/":
-            return "mounting the host root filesystem exposes the host"
-        if source in {"/var/run/docker.sock", "/run/docker.sock"}:
-            return "mounting the container runtime socket grants host-level control"
+    if flag in ENV_FLAGS:
+        name = value.split("=", 1)[0]
+        if name in PROTECTED_PASSTHROUGH_ENV_NAMES or any(
+            name.startswith(prefix) for prefix in PROTECTED_PASSTHROUGH_ENV_PREFIXES
+        ):
+            return f"{name} is controlled by the launcher/entrypoint"
+        return None
+    return REJECTED_VALUE_FLAGS[flag]
+
+
+def split_inline_flag_value(arg: str) -> tuple[str, str | None]:
+    if arg.startswith("--") and "=" in arg:
+        flag, value = arg.split("=", 1)
+        return flag, value
+    return arg, None
+
+
+def unsafe_short_arg_reason(arg: str) -> str | None:
+    if arg in {"-e", "-u", "-v", "-p"}:
+        return None
+    if arg.startswith("-e") and not arg.startswith("--"):
+        value = arg[2:].lstrip("=")
+        return unsafe_flag_value_reason("-e", value)
+    if arg.startswith("-u") and not arg.startswith("--"):
+        return REJECTED_VALUE_FLAGS["-u"]
+    if arg.startswith("-v") and not arg.startswith("--"):
+        return REJECTED_VALUE_FLAGS["-v"]
+    if arg.startswith("-p") and not arg.startswith("--"):
+        return REJECTED_VALUE_FLAGS["-p"]
     return None
-
-
-def parse_mount_options(value: str) -> dict[str, str]:
-    options: dict[str, str] = {}
-    for item in value.split(","):
-        if "=" not in item:
-            continue
-        key, mount_value = item.split("=", 1)
-        options[key] = mount_value
-    return options
 
 
 def ensure_timezone_env() -> None:
@@ -565,10 +613,12 @@ def ensure_host_paths(config: LauncherConfig) -> None:
 
     for path in (
         config.command_history_dir,
-        config.venv_dir,
-        config.uv_cache_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)
+
+    if config.persist_python:
+        for path in (config.venv_dir, config.uv_cache_dir):
+            path.mkdir(parents=True, exist_ok=True)
 
     if config.mount_agent_config:
         for path in (config.claude_dir, config.gemini_dir, config.codex_dir):
@@ -586,13 +636,31 @@ def validate_config(config: LauncherConfig) -> None:
     if config.enable_sudo_password and not config.tty:
         raise ArgumentError("--sudo requires an interactive TTY; remove --no-tty")
 
-    if config.recreate_venv and is_dangerous_recreate_path(config.venv_dir, config.workspace):
+    validate_host_mount_source("workspace", config.workspace)
+    validate_host_mount_source("history directory", config.command_history_dir)
+
+    if config.persist_python:
+        validate_host_mount_source("venv directory", config.venv_dir)
+        validate_host_mount_source("uv cache directory", config.uv_cache_dir)
+
+    if config.mount_agent_config:
+        validate_host_mount_source("Claude config directory", config.claude_dir)
+        validate_host_mount_source("Gemini config directory", config.gemini_dir)
+        validate_host_mount_source("Codex config directory", config.codex_dir)
+        validate_host_mount_source("Claude settings file", config.claude_json)
+
+    if config.recreate_venv and config.persist_python and is_dangerous_recreate_path(config.venv_dir, config.workspace):
         raise ArgumentError(f"refusing to recreate unsafe venv host path: {config.venv_dir}")
+
+    if config.persist_python:
+        validate_existing_venv_path(config.venv_dir)
 
     if config.container_venv_dir in {"/home", "/home/agent"}:
         raise ArgumentError(f"refusing unsafe container venv path: {config.container_venv_dir}")
     if config.container_uv_cache_dir in {"/home", "/home/agent"}:
         raise ArgumentError(f"refusing unsafe container uv cache path: {config.container_uv_cache_dir}")
+    validate_agent_state_container_path("venv", config.container_venv_dir)
+    validate_agent_state_container_path("uv cache", config.container_uv_cache_dir)
 
 
 def is_dangerous_recreate_path(path: Path, workspace: Path) -> bool:
@@ -602,21 +670,79 @@ def is_dangerous_recreate_path(path: Path, workspace: Path) -> bool:
     return resolved in {Path("/"), home, workspace_resolved}
 
 
+def validate_host_mount_source(label: str, path: Path) -> None:
+    resolved = path.resolve(strict=False)
+    home = Path.home().resolve(strict=False)
+    if resolved in {Path("/"), home}:
+        raise ArgumentError(f"refusing to mount unsafe host {label}: {path}")
+
+    runtime_sockets = {
+        Path("/run/docker.sock"),
+        Path("/run/podman/podman.sock"),
+        Path("/var/run/docker.sock"),
+        Path("/var/run/podman/podman.sock"),
+    }
+    if resolved in runtime_sockets:
+        raise ArgumentError(f"refusing to mount container runtime socket as {label}: {path}")
+
+
+def validate_existing_venv_path(path: Path) -> None:
+    if not path.exists():
+        return
+    if not path.is_dir():
+        raise ArgumentError(f"venv host path exists but is not a directory: {path}")
+    if (path / "pyvenv.cfg").is_file():
+        return
+    try:
+        next(path.iterdir())
+    except StopIteration:
+        return
+    raise ArgumentError(
+        "venv host path exists, is non-empty, and does not look like a Python "
+        f"virtual environment: {path}"
+    )
+
+
+def validate_agent_state_container_path(label: str, value: str) -> None:
+    normalized = value.rstrip("/")
+    if not normalized.startswith("/home/agent/"):
+        raise ArgumentError(f"container {label} path must be under /home/agent: {value}")
+
+    reserved_paths = (
+        "/home/agent/.claude",
+        "/home/agent/.codex",
+        "/home/agent/.gemini",
+        "/home/agent/.claude.json",
+    )
+    for reserved_path in reserved_paths:
+        if normalized == reserved_path or normalized.startswith(f"{reserved_path}/"):
+            raise ArgumentError(
+                f"container {label} path overlaps reserved agent config path: {value}"
+            )
+
+
 def build_mounts(config: LauncherConfig) -> list[str]:
     mounts = [
         volume_arg(config.workspace, "/workspace", "z"),
         volume_arg(config.command_history_dir, "/commandhistory", "z"),
-        volume_arg(config.venv_dir, config.container_venv_dir, "z"),
-        volume_arg(config.uv_cache_dir, config.container_uv_cache_dir, "z"),
     ]
 
-    if config.mount_agent_config:
+    if config.persist_python:
         mounts.extend(
             [
-                volume_arg(config.claude_dir, "/home/agent/.claude", "z"),
-                volume_arg(config.gemini_dir, "/home/agent/.gemini", "z"),
-                volume_arg(config.codex_dir, "/home/agent/.codex", "z"),
-                volume_arg(config.claude_json, "/home/agent/.claude.json", "z"),
+                volume_arg(config.venv_dir, config.container_venv_dir, "z"),
+                volume_arg(config.uv_cache_dir, config.container_uv_cache_dir, "z"),
+            ]
+        )
+
+    if config.mount_agent_config:
+        config_mount_options = "z" if config.writable_agent_config else "ro,z"
+        mounts.extend(
+            [
+                volume_arg(config.claude_dir, "/home/agent/.claude", config_mount_options),
+                volume_arg(config.gemini_dir, "/home/agent/.gemini", config_mount_options),
+                volume_arg(config.codex_dir, "/home/agent/.codex", config_mount_options),
+                volume_arg(config.claude_json, "/home/agent/.claude.json", config_mount_options),
             ]
         )
     return mounts
@@ -630,11 +756,12 @@ def build_env_args(config: LauncherConfig) -> list[str]:
     explicit_env = build_explicit_env(config)
     env_args: list[str] = []
 
-    for name in FORWARDED_SECRET_ENV_NAMES:
-        if name in explicit_env:
-            continue
-        if os.environ.get(name):
-            env_args.append(f"--env={name}")
+    if config.forward_secret_env:
+        for name in FORWARDED_SECRET_ENV_NAMES:
+            if name in explicit_env:
+                continue
+            if os.environ.get(name):
+                env_args.append(f"--env={name}")
 
     for name, value in explicit_env.items():
         env_args.append(f"--env={name}={value}")
@@ -658,8 +785,6 @@ def build_explicit_env(config: LauncherConfig) -> dict[str, str]:
         env["AGENTS_DISABLE_FIREWALL"] = "1"
     if config.allow_host_network:
         env["AGENTS_ALLOW_HOST_NETWORK"] = "1"
-    if config.keep_firewall_sudo:
-        env["AGENTS_KEEP_FIREWALL_SUDO"] = "1"
     if config.enable_sudo_password:
         env["AGENTS_ENABLE_SUDO_PASSWORD"] = "1"
     if config.recreate_venv:
@@ -679,10 +804,13 @@ def build_run_command(runtime: str, config: LauncherConfig) -> list[str]:
 
     command.extend(
         [
-            # NET_ADMIN and NET_RAW are required by init-firewall.sh, which uses
-            # iptables/ipset to restrict outbound traffic to an allowlist.
+            # init-firewall.sh needs NET_ADMIN for iptables during startup.
+            # gosu needs SETUID/SETGID so the root entrypoint can drop to agent.
+            "--cap-drop=ALL",
             "--cap-add=NET_ADMIN",
-            "--cap-add=NET_RAW",
+            "--cap-add=SETGID",
+            "--cap-add=SETUID",
+            *([] if config.enable_sudo_password else ["--security-opt=no-new-privileges:true"]),
             *build_mounts(config),
             *build_env_args(config),
             *config.extra_args,
