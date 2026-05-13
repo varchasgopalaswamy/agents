@@ -39,10 +39,15 @@ starts the container with the following mounts and settings:
 | `~/.local/share/agents/commandhistory` | `/commandhistory` | Persistent bash history |
 
 Saved Claude/Gemini/Codex config directories are not mounted by default. Use
-`--agent-config` to mount them read-only, or `--writable-agent-config` as an
-explicit opt-in when the container should be able to modify host agent config.
+`--mount-agent-config` to mount them read-only. Add
+`--writable-agent-config` only when the container should be able to modify host
+agent config. Detected `.git` metadata under the workspace is mounted read-only
+by default; use `--writable-vcs` only when in-container Git writes are needed.
 The Python venv and uv cache are also container-local by default; use
-`--persist-python` to mount host paths for reuse across sessions.
+`--persist-python` to mount host paths for reuse across sessions. Outbound
+network access starts deny-by-default; add provider or registry bundles such as
+`--allow-openai`, `--allow-github`, or `--allow-pypi` for the destinations you
+intend to permit.
 
 ### Environment variables
 
@@ -70,15 +75,27 @@ command-line options.
   `AGENTS_CODEX_DIR` set agent config mount sources
 - `AGENTS_MOUNT_AGENT_CONFIG=1` mounts saved agent config read-only
 - `AGENTS_WRITABLE_AGENT_CONFIG=1` makes mounted agent config read/write
+- `AGENTS_WRITABLE_VCS=1` allows writes to detected `.git` metadata
 - `AGENTS_FORWARD_SECRET_ENV=1` forwards supported API/token environment variables
 - `AGENTS_DISABLE_FIREWALL=1` skips firewall initialization
 - `AGENTS_ALLOW_HOST_NETWORK=1` allows the container to reach the host gateway
+- `AGENTS_ALLOW_OPENAI=1` allows OpenAI API and ChatGPT auth/web endpoints
+- `AGENTS_ALLOW_ANTHROPIC=1` allows Anthropic API and Claude web endpoints
+- `AGENTS_ALLOW_GOOGLE=1` allows Gemini/Google API and auth endpoints
+- `AGENTS_ALLOW_GITHUB=1` allows GitHub API/web/git/release/content endpoints and GitHub meta IP ranges
+- `AGENTS_ALLOW_COPILOT=1` allows GitHub Copilot service endpoints
+- `AGENTS_ALLOW_PYPI=1` allows PyPI package index and file endpoints
+- `AGENTS_ALLOW_NPM=1` allows the npm registry
+- `AGENTS_ALLOW_VSCODE=1` allows VS Code extension marketplace and update endpoints
 - `AGENTS_ALLOWED_DOMAINS` adds comma- or space-separated firewall allowlist domains
 - `AGENTS_ALLOWED_CIDRS` adds comma- or space-separated firewall allowlist IPv4 CIDRs/IPs
 - `AGENTS_PYTHON_VERSION` selects the Python version used when creating the venv
 - `AGENTS_RECREATE_VENV=1` recreates the mounted venv on startup
 - `AGENTS_ENABLE_SUDO_PASSWORD=1` prompts for password-based sudo setup during startup
 - `AGENTS_EXTRA_ARGS` adds extra docker/podman run arguments
+- `AGENTS_ALLOW_UNSAFE_HOST_PATHS` permits specific otherwise rejected launcher-owned host mount paths
+- `AGENTS_ALLOW_UNSAFE_RUNTIME_FLAGS` permits specific otherwise rejected docker/podman passthrough flags
+- `AGENTS_ALLOW_UNSAFE_FLAGS=1` allows otherwise rejected docker/podman passthrough flags
 
 When secret forwarding is enabled, secrets are forwarded as environment variable
 names, not literal `NAME=value` arguments, so API keys are not exposed in the
@@ -113,16 +130,31 @@ start-agents --python 3.12
 # Recreate the venv if you intentionally want a fresh interpreter/env
 start-agents --python 3.12 --recreate-venv
 
-# Add package mirrors or internal services to the firewall allowlist
+# Allow only the provider, VCS host, and package registry this session needs
+start-agents --allow-openai --allow-github --allow-pypi
+
+# Add internal services or private mirrors to the firewall allowlist
 start-agents \
   --allow-domain pypi.my-company.example \
   --allow-cidr 10.40.0.0/16
 
 # Mount saved agent credentials/config read-only
-start-agents --agent-config
+start-agents --mount-agent-config
+
+# Permit Git commands that update refs, objects, hooks, config, or history
+start-agents --writable-vcs
 
 # Forward API/token environment variables only when needed
-start-agents --forward-secret-env
+start-agents --forward-secret-env --allow-openai
+
+# Bypass one rejected runtime flag, with a loud warning
+start-agents --allow-unsafe-runtime-flag=--volume \
+  my-image:dev --volume /tmp/tool-cache:/tool-cache
+
+# Bypass one rejected launcher-owned host path, with a loud warning
+start-agents \
+  --history-dir ~/.ssh \
+  --allow-unsafe-host-path ~/.ssh
 ```
 
 Run `start-agents --help` for the full option list, including custom
@@ -152,9 +184,12 @@ workspace = "~/src/my-project"
 name = "agents-my-project"
 dry-run = false
 tty = true
-mount-agent-config = true
+mount-agent-config = false
 writable-agent-config = false
 forward-secret-env = false
+writable-vcs = false
+allow-unsafe-host-path = []
+allow-unsafe-runtime-flag = []
 extra-args = ["--env", "MY_TOOL_FLAG=1"]
 
 [start-agents.paths]
@@ -171,6 +206,14 @@ recreate-venv = false
 [start-agents.firewall]
 disable-firewall = false
 allow-host-network = false
+allow-openai = true
+allow-anthropic = false
+allow-google = false
+allow-github = true
+allow-copilot = false
+allow-pypi = true
+allow-npm = false
+allow-vscode = false
 allowed-domains = ["pypi.my-company.example"]
 allowed-cidrs = ["10.40.0.0/16"]
 
@@ -196,6 +239,52 @@ over stdin, and never passed as a launcher flag, environment variable, Docker
 argument, mounted file, or shell command argument. After bootstrap, the
 default `no-new-privileges` runtime setting is omitted so password-based sudo
 can work.
+
+### Privilege and exposure options
+
+Several options intentionally increase what the agent can access. Treat them as
+capability grants to code you may not fully trust:
+
+- `--sudo` gives the agent a path to root inside the container and disables the
+  default `no-new-privileges` setting, increasing the impact of container escape
+  bugs and allowing firewall or tooling tampering after startup.
+- `--disable-firewall` permits unrestricted outbound network access, enabling
+  direct exfiltration to any destination.
+- `--allow-host-network` permits access to services on the host gateway,
+  including local databases, metadata services, dev servers, and unauthenticated
+  admin panels.
+- `--forward-secret-env` exposes supported API tokens to the agent process;
+  tokens can be read and sent to any allowed endpoint.
+- `--mount-agent-config` exposes saved agent credentials and config. Read-only
+  mounts prevent modification, but not theft.
+- `--writable-agent-config` allows credential/config tampering, persistence, and
+  host-side agent behavior changes. It requires `--mount-agent-config`.
+- `--persist-python` exposes a host venv/cache to code execution and package
+  poisoning across sessions.
+- `--writable-vcs` allows rewriting refs, objects, hooks, config, and history in
+  the host repository.
+- `--allow-unsafe-host-path PATH` bypasses launcher mount-source rejection for a
+  specific host path. It can expose broad host directories, credential stores,
+  runtime sockets, or VCS internals if you name those paths.
+- `--allow-unsafe-runtime-flag FLAG` bypasses rejection for one specific
+  docker/podman passthrough flag, for example `--volume` or `--device`. Use the
+  `--allow-unsafe-runtime-flag=--flag` form when the flag itself starts with
+  `--`.
+- `AGENTS_ALLOW_UNSAFE_FLAGS=1` allows runtime options that may expose host
+  files, devices, sockets, namespaces, ports, credentials, or bypass the
+  launcher entrypoint/firewall.
+- Custom `--allow-domain` and `--allow-cidr` rules create exfiltration
+  destinations controlled by the chosen host or network.
+
+Provider bundles such as `--allow-openai`, `--allow-anthropic`,
+`--allow-google`, `--allow-github`, and `--allow-copilot` enable legitimate
+agent operation. They also create channels where an untrusted agent can encode
+workspace secrets into normal-looking API, web, git, or package requests.
+
+The unsafe host-path and runtime-flag bypasses print an explicit warning before
+the launch command. The warning is intentional: if an untrusted agent steals
+tokens, rewrites files, or reaches host services through a bypass you enabled,
+that is the expected risk of the option.
 
 ### Python
 
@@ -229,35 +318,53 @@ docker build \
 ### Firewall and sandboxing
 
 The container starts the firewall automatically unless
-`AGENTS_DISABLE_FIREWALL=1` is set. The firewall:
+`AGENTS_DISABLE_FIREWALL=1` is set. By default, it allows no provider, package,
+or source-host endpoints. It permits loopback and established traffic required
+by the rules, blocks host gateway access unless `AGENTS_ALLOW_HOST_NETWORK=1`
+is set, rejects runtime DNS egress after startup resolution, and applies a
+default outbound deny policy.
 
-- Allows GitHub ranges from `https://api.github.com/meta`
-- Allows the model/package domains listed in `init-firewall.sh`, including
-  Anthropic, OpenAI, Gemini/Google auth, GitHub Copilot, npm, PyPI, and VS Code
-  extension update endpoints
-- Omits telemetry-only domains from the default allowlist
-- Allows extra domains from `--allow-domain`, `--allow-domains`, or
-  `AGENTS_ALLOWED_DOMAINS`
-- Allows extra IPv4 CIDRs/IPs from `--allow-cidr`, `--allow-cidrs`, or
-  `AGENTS_ALLOWED_CIDRS`
-- Writes resolved allowlisted hostnames to `/etc/hosts`, then blocks runtime
-  DNS egress to reduce DNS-based exfiltration
-- Emits direct destination allow rules with iptables
-- Drops IPv6 outbound traffic
-- Blocks host gateway access unless `AGENTS_ALLOW_HOST_NETWORK=1` is set
-- Verifies that `https://example.com` is blocked and that GitHub and PyPI are
-  reachable
-- Removes legacy passwordless sudo bootstrap files if present
+Use explicit bundles for expected destinations:
+
+| Option | Allowed destinations |
+|--------|----------------------|
+| `--allow-openai` | `api.openai.com`, `auth.openai.com`, `chatgpt.com` |
+| `--allow-anthropic` | `api.anthropic.com`, `claude.ai` |
+| `--allow-google` | `accounts.google.com`, `oauth2.googleapis.com`, `www.googleapis.com`, `generativelanguage.googleapis.com`, `cloudcode-pa.googleapis.com` |
+| `--allow-github` | `api.github.com`, `github.com`, `codeload.github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `gist.githubusercontent.com`, `github-releases.githubusercontent.com`, plus GitHub meta IP ranges |
+| `--allow-copilot` | `api.githubcopilot.com`, `copilot-proxy.githubusercontent.com` |
+| `--allow-pypi` | `pypi.org`, `files.pythonhosted.org` |
+| `--allow-npm` | `registry.npmjs.org` |
+| `--allow-vscode` | `marketplace.visualstudio.com`, `update.code.visualstudio.com`, `vscode.blob.core.windows.net` |
+
+Custom rules from `--allow-domain`, `--allow-domains`, or
+`AGENTS_ALLOWED_DOMAINS` add extra resolved hostnames. Custom rules from
+`--allow-cidr`, `--allow-cidrs`, or `AGENTS_ALLOWED_CIDRS` add extra IPv4
+CIDRs/IPs. The firewall validates IPv4 octets and CIDR prefix lengths
+numerically, writes resolved allowlisted hostnames to `/etc/hosts`, emits direct
+destination allow rules with iptables, and fails startup if IPv6 appears
+available but cannot be blocked.
+
+Verification always checks that `https://example.com` is blocked. It only checks
+allowed endpoints for bundles you enabled, so a no-bundle launch verifies the
+deny-by-default posture without requiring GitHub, PyPI, or model-provider
+access. The firewall removes legacy passwordless sudo bootstrap files if
+present.
 
 The launcher also rejects dangerous runtime flags by default, including
 `--privileged`, custom network/DNS/namespace settings, extra capabilities,
-extra mounts, device passthrough, published ports, entrypoint/user overrides,
-env-file injection, and attempts to override launcher-controlled environment
-variables. The default runtime capability set drops everything, then adds only
-`NET_ADMIN` for firewall setup and `SETUID`/`SETGID` so the root entrypoint can
-drop to the `agent` user. Launcher-owned mount sources also reject broad host
-mounts such as `/`, the host home directory, and container runtime sockets. To
-intentionally pass one of those flags, set `AGENTS_ALLOW_UNSAFE_FLAGS=1`.
+extra mounts, `--volumes-from`, `--env-host`, runtime secrets, preserved file
+descriptors, custom root filesystems, OCI hook controls, device passthrough,
+published ports, entrypoint/user overrides, env-file injection, and attempts to
+override launcher-controlled environment variables. The default runtime
+capability set drops everything, then adds only `NET_ADMIN` for firewall setup
+and `SETUID`/`SETGID` so the root entrypoint can drop to the `agent` user.
+Launcher-owned mount sources reject ambiguous paths containing `:` or newlines,
+broad host mounts such as `/` and the host home directory, container runtime
+sockets, host credential directories, and direct VCS metadata mounts. To bypass
+a specific mount-source rejection, use `--allow-unsafe-host-path PATH`. To pass
+one rejected runtime flag, use `--allow-unsafe-runtime-flag=--flag`; to bypass
+all runtime-flag rejection, set `AGENTS_ALLOW_UNSAFE_FLAGS=1`.
 
 ### Custom image or extra flags
 

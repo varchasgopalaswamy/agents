@@ -22,32 +22,58 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 ALLOWED_NETWORKS=()
-ALLOWED_DOMAINS=(
-    "accounts.google.com"
-    "api.anthropic.com"
-    "api.githubcopilot.com"
+ALLOWED_DOMAINS=()
+VERIFY_ALLOWED_URLS=()
+VERIFY_ALLOWED_LABELS=()
+ALLOW_GITHUB_RANGES=0
+
+OPENAI_DOMAINS=(
     "api.openai.com"
     "auth.openai.com"
     "chatgpt.com"
+)
+
+ANTHROPIC_DOMAINS=(
+    "api.anthropic.com"
     "claude.ai"
+)
+
+GOOGLE_DOMAINS=(
+    "accounts.google.com"
     "cloudcode-pa.googleapis.com"
-    "copilot-proxy.githubusercontent.com"
-    "files.pythonhosted.org"
     "generativelanguage.googleapis.com"
+    "oauth2.googleapis.com"
+    "www.googleapis.com"
+)
+
+GITHUB_DOMAINS=(
     "api.github.com"
     "codeload.github.com"
     "github.com"
     "github-releases.githubusercontent.com"
     "gist.githubusercontent.com"
-    "marketplace.visualstudio.com"
-    "oauth2.googleapis.com"
     "objects.githubusercontent.com"
-    "pypi.org"
     "raw.githubusercontent.com"
+)
+
+COPILOT_DOMAINS=(
+    "api.githubcopilot.com"
+    "copilot-proxy.githubusercontent.com"
+)
+
+PYPI_DOMAINS=(
+    "files.pythonhosted.org"
+    "pypi.org"
+)
+
+NPM_DOMAINS=(
     "registry.npmjs.org"
+)
+
+VSCODE_DOMAINS=(
+    "marketplace.visualstudio.com"
     "update.code.visualstudio.com"
     "vscode.blob.core.windows.net"
-    "www.googleapis.com"
 )
 
 split_config_list() {
@@ -73,6 +99,81 @@ normalize_domain() {
     printf '%s' "$domain"
 }
 
+env_flag_enabled() {
+    local name="$1"
+    local value="${!name:-0}"
+    case "$value" in
+        1|true|True|TRUE|yes|Yes|YES|on|On|ON)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+add_bundle_domains() {
+    local bundle="$1"
+    shift
+
+    local domain
+    for domain in "$@"; do
+        echo "Enabling $bundle firewall domain $domain"
+        ALLOWED_DOMAINS+=("$domain")
+    done
+}
+
+add_verify_allowed() {
+    local url="$1"
+    local label="$2"
+
+    VERIFY_ALLOWED_URLS+=("$url")
+    VERIFY_ALLOWED_LABELS+=("$label")
+}
+
+configure_provider_bundles() {
+    if env_flag_enabled AGENTS_ALLOW_OPENAI; then
+        add_bundle_domains "OpenAI" "${OPENAI_DOMAINS[@]}"
+        add_verify_allowed "https://api.openai.com/v1/models" "OpenAI API"
+    fi
+
+    if env_flag_enabled AGENTS_ALLOW_ANTHROPIC; then
+        add_bundle_domains "Anthropic" "${ANTHROPIC_DOMAINS[@]}"
+        add_verify_allowed "https://api.anthropic.com/v1/messages" "Anthropic API"
+    fi
+
+    if env_flag_enabled AGENTS_ALLOW_GOOGLE; then
+        add_bundle_domains "Google" "${GOOGLE_DOMAINS[@]}"
+        add_verify_allowed "https://generativelanguage.googleapis.com" "Gemini API"
+    fi
+
+    if env_flag_enabled AGENTS_ALLOW_GITHUB; then
+        add_bundle_domains "GitHub" "${GITHUB_DOMAINS[@]}"
+        add_verify_allowed "https://api.github.com/zen" "GitHub API"
+        ALLOW_GITHUB_RANGES=1
+    fi
+
+    if env_flag_enabled AGENTS_ALLOW_COPILOT; then
+        add_bundle_domains "GitHub Copilot" "${COPILOT_DOMAINS[@]}"
+        add_verify_allowed "https://api.githubcopilot.com" "GitHub Copilot API"
+    fi
+
+    if env_flag_enabled AGENTS_ALLOW_PYPI; then
+        add_bundle_domains "PyPI" "${PYPI_DOMAINS[@]}"
+        add_verify_allowed "https://pypi.org/simple/pip/" "PyPI"
+    fi
+
+    if env_flag_enabled AGENTS_ALLOW_NPM; then
+        add_bundle_domains "npm" "${NPM_DOMAINS[@]}"
+        add_verify_allowed "https://registry.npmjs.org/npm" "npm registry"
+    fi
+
+    if env_flag_enabled AGENTS_ALLOW_VSCODE; then
+        add_bundle_domains "VS Code" "${VSCODE_DOMAINS[@]}"
+        add_verify_allowed "https://update.code.visualstudio.com" "VS Code updates"
+    fi
+}
+
 append_configured_domains() {
     if [ -z "${AGENTS_ALLOWED_DOMAINS:-}" ]; then
         return
@@ -92,11 +193,35 @@ append_configured_domains() {
 }
 
 is_ipv4() {
-    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+
+    local IFS=.
+    local octets=()
+    read -r -a octets <<< "$ip"
+    [ "${#octets[@]}" -eq 4 ] || return 1
+
+    local octet
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        [ "$((10#$octet))" -le 255 ] || return 1
+    done
 }
 
 is_ipv4_cidr() {
-    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]
+    local cidr="$1"
+    [[ "$cidr" == */* ]] || return 1
+
+    local ip="${cidr%/*}"
+    local prefix="${cidr#*/}"
+    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    is_ipv4 "$ip" || return 1
+    [ "$((10#$prefix))" -le 32 ]
+}
+
+ipv6_available() {
+    [ -r /proc/net/if_inet6 ] || return 1
+    awk '$6 != "lo" { found=1 } END { exit found ? 0 : 1 }' /proc/net/if_inet6
 }
 
 have_ip6tables() {
@@ -117,7 +242,11 @@ reset_ipv4_firewall() {
 
 drop_ipv6_firewall() {
     if ! have_ip6tables; then
-        echo "IPv6 firewall unavailable; skipping IPv6 rules"
+        if ipv6_available; then
+            echo "ERROR: IPv6 appears available but ip6tables cannot enforce a deny policy" >&2
+            exit 1
+        fi
+        echo "IPv6 unavailable; skipping IPv6 rules"
         return
     fi
 
@@ -180,7 +309,11 @@ add_github_ranges() {
         fi
         echo "Adding GitHub range $cidr"
         ALLOWED_NETWORKS+=("$cidr")
-    done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git + (.packages // []))[]' | aggregate -q)
+    done < <(
+        echo "$gh_ranges" |
+            jq -r '(.web + .api + .git + (.packages // []))[] | select(test("^[0-9]"))' |
+            aggregate -q
+    )
 }
 
 add_allowed_domain() {
@@ -283,6 +416,13 @@ verify_allowed() {
     echo "Firewall verification passed - reached $label"
 }
 
+verify_allowed_bundles() {
+    local index
+    for index in "${!VERIFY_ALLOWED_URLS[@]}"; do
+        verify_allowed "${VERIFY_ALLOWED_URLS[$index]}" "${VERIFY_ALLOWED_LABELS[$index]}"
+    done
+}
+
 revoke_firewall_sudo() {
     if [ -f /etc/sudoers.d/agent-firewall ]; then
         rm -f /etc/sudoers.d/agent-firewall
@@ -296,9 +436,12 @@ reset_ipv4_firewall
 drop_ipv6_firewall
 restore_docker_dns_rules "$DOCKER_DNS_RULES"
 
-add_github_ranges
+configure_provider_bundles
 add_configured_cidrs
 append_configured_domains
+if [ "$ALLOW_GITHUB_RANGES" = "1" ]; then
+    add_github_ranges
+fi
 add_allowed_domains
 allow_base_ipv4_traffic
 allow_host_gateway_if_requested
@@ -307,6 +450,5 @@ apply_default_denies
 echo "Firewall configuration complete"
 echo "Verifying firewall rules..."
 verify_blocked "https://example.com" "https://example.com"
-verify_allowed "https://api.github.com/zen" "https://api.github.com"
-verify_allowed "https://pypi.org/simple/pip/" "https://pypi.org"
+verify_allowed_bundles
 revoke_firewall_sudo
