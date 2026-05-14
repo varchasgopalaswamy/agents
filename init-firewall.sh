@@ -3,11 +3,16 @@ set -euo pipefail
 IFS=$'\n\t'
 
 ALLOW_HOST_NETWORK=0
+DEBUG_DENIALS=0
+DENY_LOG_PREFIX="AGENTS-FW-DENY "
 
 for arg in "$@"; do
     case "$arg" in
         --allow-host-network)
             ALLOW_HOST_NETWORK=1
+            ;;
+        --debug-denials)
+            DEBUG_DENIALS=1
             ;;
         *)
             echo "ERROR: unknown firewall option: $arg" >&2
@@ -228,6 +233,34 @@ have_ip6tables() {
     command -v ip6tables >/dev/null 2>&1 && ip6tables -L >/dev/null 2>&1
 }
 
+add_ipv4_deny_log() {
+    local label="$1"
+    shift
+
+    if [ "$DEBUG_DENIALS" != "1" ]; then
+        return
+    fi
+
+    if ! iptables "$@" -m limit --limit 6/min --limit-burst 12 -j LOG \
+        --log-prefix "$DENY_LOG_PREFIX$label " --log-level warning 2>/dev/null; then
+        echo "WARNING: unable to install IPv4 firewall denial log rule for $label" >&2
+    fi
+}
+
+add_ipv6_deny_log() {
+    local label="$1"
+    shift
+
+    if [ "$DEBUG_DENIALS" != "1" ]; then
+        return
+    fi
+
+    if ! ip6tables "$@" -m limit --limit 6/min --limit-burst 12 -j LOG \
+        --log-prefix "$DENY_LOG_PREFIX$label " --log-level warning 2>/dev/null; then
+        echo "WARNING: unable to install IPv6 firewall denial log rule for $label" >&2
+    fi
+}
+
 reset_ipv4_firewall() {
     iptables -P INPUT ACCEPT || true
     iptables -P FORWARD ACCEPT || true
@@ -262,6 +295,7 @@ drop_ipv6_firewall() {
     ip6tables -A OUTPUT -o lo -j ACCEPT
     ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
     ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    add_ipv6_deny_log "ipv6-output" -A OUTPUT
     ip6tables -A OUTPUT -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || ip6tables -A OUTPUT -j REJECT
 
     ip6tables -P INPUT DROP
@@ -283,7 +317,9 @@ restore_docker_dns_rules() {
 }
 
 allow_base_ipv4_traffic() {
+    add_ipv4_deny_log "dns-udp" -A OUTPUT -p udp --dport 53
     iptables -A OUTPUT -p udp --dport 53 -j REJECT
+    add_ipv4_deny_log "dns-tcp" -A OUTPUT -p tcp --dport 53
     iptables -A OUTPUT -p tcp --dport 53 -j REJECT --reject-with tcp-reset 2>/dev/null || iptables -A OUTPUT -p tcp --dport 53 -j REJECT
     iptables -A INPUT -i lo -j ACCEPT
     iptables -A OUTPUT -o lo -j ACCEPT
@@ -391,6 +427,7 @@ apply_default_denies() {
     for network in "${ALLOWED_NETWORKS[@]}"; do
         iptables -A OUTPUT -d "$network" -j ACCEPT
     done
+    add_ipv4_deny_log "ipv4-output" -A OUTPUT
     iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
 }
 
@@ -448,6 +485,10 @@ allow_host_gateway_if_requested
 apply_default_denies
 
 echo "Firewall configuration complete"
+if [ "$DEBUG_DENIALS" = "1" ]; then
+    echo "Firewall denial debug logging enabled with prefix: $DENY_LOG_PREFIX"
+    echo "Denied packet logs are emitted by the kernel and may appear in docker/podman logs or the host kernel log."
+fi
 echo "Verifying firewall rules..."
 verify_blocked "https://example.com" "https://example.com"
 verify_allowed_bundles

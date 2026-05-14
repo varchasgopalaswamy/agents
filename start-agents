@@ -107,6 +107,7 @@ class LauncherConfig:
     allow_pypi: bool = False
     allow_npm: bool = False
     allow_vscode: bool = False
+    debug_firewall: bool = False
     mount_agent_config: bool = False
     writable_agent_config: bool = False
     writable_vcs: bool = False
@@ -371,6 +372,12 @@ def build_arg_parser() -> configargparse.ArgParser:
         env_var="AGENTS_ALLOW_HOST_NETWORK",
         help="allow outbound access to the host gateway",
     )
+    firewall_group.add(
+        "--debug-firewall",
+        action="store_true",
+        env_var="AGENTS_DEBUG_FIREWALL",
+        help="log firewall-denied outbound packets with an AGENTS-FW-DENY prefix",
+    )
     sudo_group = parser.add_argument_group("sudo")
     sudo_group.add(
         "--sudo",
@@ -489,6 +496,7 @@ def config_from_namespace(namespace: argparse.Namespace) -> LauncherConfig:
         allow_pypi=namespace.allow_pypi,
         allow_npm=namespace.allow_npm,
         allow_vscode=namespace.allow_vscode,
+        debug_firewall=namespace.debug_firewall,
         mount_agent_config=namespace.mount_agent_config,
         writable_agent_config=namespace.writable_agent_config,
         writable_vcs=namespace.writable_vcs,
@@ -1106,6 +1114,8 @@ def build_explicit_env(config: LauncherConfig) -> dict[str, str]:
         env["AGENTS_DISABLE_FIREWALL"] = "1"
     if config.allow_host_network:
         env["AGENTS_ALLOW_HOST_NETWORK"] = "1"
+    if config.debug_firewall:
+        env["AGENTS_DEBUG_FIREWALL"] = "1"
     if config.enable_sudo_password:
         env["AGENTS_ENABLE_SUDO_PASSWORD"] = "1"
     if config.recreate_venv:

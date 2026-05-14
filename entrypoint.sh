@@ -108,6 +108,9 @@ if [ "${AGENTS_DISABLE_FIREWALL:-0}" != "1" ]; then
     if [ "${AGENTS_ALLOW_HOST_NETWORK:-0}" = "1" ]; then
         firewall_args+=("--allow-host-network")
     fi
+    if [ "${AGENTS_DEBUG_FIREWALL:-0}" = "1" ]; then
+        firewall_args+=("--debug-denials")
+    fi
     /usr/local/bin/init-firewall.sh "${firewall_args[@]}"
 fi
 

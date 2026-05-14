@@ -89,6 +89,7 @@ command-line options.
 - `AGENTS_ALLOW_VSCODE=1` allows VS Code extension marketplace and update endpoints
 - `AGENTS_ALLOWED_DOMAINS` adds comma- or space-separated firewall allowlist domains
 - `AGENTS_ALLOWED_CIDRS` adds comma- or space-separated firewall allowlist IPv4 CIDRs/IPs
+- `AGENTS_DEBUG_FIREWALL=1` enables rate-limited firewall denial logging
 - `AGENTS_PYTHON_VERSION` selects the Python version used when creating the venv
 - `AGENTS_RECREATE_VENV=1` recreates the mounted venv on startup
 - `AGENTS_ENABLE_SUDO_PASSWORD=1` prompts for password-based sudo setup during startup
@@ -214,6 +215,7 @@ allow-copilot = false
 allow-pypi = true
 allow-npm = false
 allow-vscode = false
+debug-firewall = false
 allowed-domains = ["pypi.my-company.example"]
 allowed-cidrs = ["10.40.0.0/16"]
 
@@ -324,6 +326,12 @@ by the rules, blocks host gateway access unless `AGENTS_ALLOW_HOST_NETWORK=1`
 is set, rejects runtime DNS egress after startup resolution, and applies a
 default outbound deny policy.
 
+Use `--debug-firewall` or `AGENTS_DEBUG_FIREWALL=1` to add rate-limited kernel
+log rules immediately before denied DNS and default outbound rejects. Denied
+packet logs use the `AGENTS-FW-DENY` prefix and may appear in `docker logs`,
+`podman logs`, or the host kernel log depending on the runtime and host logging
+configuration.
+
 Use explicit bundles for expected destinations:
 
 | Option | Allowed destinations |
@@ -336,6 +344,17 @@ Use explicit bundles for expected destinations:
 | `--allow-pypi` | `pypi.org`, `files.pythonhosted.org` |
 | `--allow-npm` | `registry.npmjs.org` |
 | `--allow-vscode` | `marketplace.visualstudio.com`, `update.code.visualstudio.com`, `vscode.blob.core.windows.net` |
+
+The firewall is an egress destination control, not a malware scanner or package
+trust system. A default launch prevents direct downloads from package registries,
+GitHub release/content hosts, arbitrary mirrors, and other external source
+hosts because those destinations are not allowed. Once you enable a bundle such
+as `--allow-pypi`, `--allow-npm`, or `--allow-github`, the agent can download
+any content those services serve, including compromised packages, malicious
+repository files, release artifacts, or code generated through an allowed model
+provider. Use the narrowest allowlist that fits the task, prefer pinned
+dependencies and reviewed repositories, and treat custom `--allow-domain` or
+`--allow-cidr` entries as explicit code-download and exfiltration channels.
 
 Custom rules from `--allow-domain`, `--allow-domains`, or
 `AGENTS_ALLOWED_DOMAINS` add extra resolved hostnames. Custom rules from
