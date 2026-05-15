@@ -73,6 +73,17 @@ case "$UV_CACHE_DIR" in
         ;;
 esac
 
+if [ "${AGENTS_DISABLE_FIREWALL:-0}" != "1" ]; then
+    firewall_args=()
+    if [ "${AGENTS_ALLOW_HOST_NETWORK:-0}" = "1" ]; then
+        firewall_args+=("--allow-host-network")
+    fi
+    if [ "${AGENTS_DEBUG_FIREWALL:-0}" = "1" ]; then
+        firewall_args+=("--debug-denials")
+    fi
+    /usr/local/bin/init-firewall.sh "${firewall_args[@]}"
+fi
+
 run_as_agent mkdir -p "$UV_CACHE_DIR"
 
 if [ "${AGENTS_RECREATE_VENV:-0}" = "1" ] && [ -e "$UV_PROJECT_ENVIRONMENT" ]; then
@@ -82,15 +93,15 @@ if [ "${AGENTS_RECREATE_VENV:-0}" = "1" ] && [ -e "$UV_PROJECT_ENVIRONMENT" ]; t
 fi
 
 if [ ! -x "$UV_PROJECT_ENVIRONMENT/bin/python" ]; then
-    venv_args=(--seed)
     if [ -n "${AGENTS_PYTHON_VERSION:-}" ]; then
-        venv_args+=(--python "$AGENTS_PYTHON_VERSION")
         echo "Initializing Python $AGENTS_PYTHON_VERSION virtual environment at $UV_PROJECT_ENVIRONMENT..."
+        run_as_agent mkdir -p "$UV_PROJECT_ENVIRONMENT"
+        run_as_agent uv venv --python "$AGENTS_PYTHON_VERSION" "$UV_PROJECT_ENVIRONMENT"
     else
         echo "Initializing Python virtual environment at $UV_PROJECT_ENVIRONMENT..."
+        run_as_agent mkdir -p "$UV_PROJECT_ENVIRONMENT"
+        run_as_agent python -m venv "$UV_PROJECT_ENVIRONMENT"
     fi
-    run_as_agent mkdir -p "$UV_PROJECT_ENVIRONMENT"
-    run_as_agent uv venv "${venv_args[@]}" "$UV_PROJECT_ENVIRONMENT"
 elif [ -n "${AGENTS_PYTHON_VERSION:-}" ]; then
     actual_python_version=$(run_as_agent "$UV_PROJECT_ENVIRONMENT/bin/python" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')
     if [[ "$AGENTS_PYTHON_VERSION" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] && [[ "$actual_python_version" != "$AGENTS_PYTHON_VERSION"* ]]; then
@@ -101,17 +112,6 @@ fi
 
 if [ "${AGENTS_ENABLE_SUDO_PASSWORD:-0}" = "1" ]; then
     /usr/local/bin/configure-sudo-password.sh
-fi
-
-if [ "${AGENTS_DISABLE_FIREWALL:-0}" != "1" ]; then
-    firewall_args=()
-    if [ "${AGENTS_ALLOW_HOST_NETWORK:-0}" = "1" ]; then
-        firewall_args+=("--allow-host-network")
-    fi
-    if [ "${AGENTS_DEBUG_FIREWALL:-0}" = "1" ]; then
-        firewall_args+=("--debug-denials")
-    fi
-    /usr/local/bin/init-firewall.sh "${firewall_args[@]}"
 fi
 
 /usr/local/bin/revoke-bootstrap-sudo.sh >/dev/null 2>&1 || true

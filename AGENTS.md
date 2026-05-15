@@ -19,7 +19,8 @@ There is no dedicated `src/`, `tests/`, or assets directory; keep new files near
 - `podman build -t ghcr.io/varchasgopalaswamy/agents:latest .` is the Podman equivalent.
 - `./start-agents [IMAGE] [EXTRA_ARGS...]` launches the container from the current project directory.
 - `python3 -m py_compile start-agents` checks the launcher for Python syntax errors.
-- `bash -n entrypoint.sh init-firewall.sh` checks shell scripts for syntax errors.
+- `bash -n entrypoint.sh init-firewall.sh configure-sudo-password.sh revoke-bootstrap-sudo.sh security-smoke.sh` checks shell scripts for syntax errors.
+- `./security-smoke.sh` builds a local test image and runs launcher/runtime security smoke checks when Docker or Podman is available.
 
 ## Coding Style & Naming Conventions
 
@@ -27,7 +28,7 @@ Use Python 3 conventions in `start-agents`: four-space indentation, `snake_case`
 
 ## Testing Guidelines
 
-There is no formal test framework or coverage target. For changes, run the syntax checks above and, when Docker or Podman is available, build the image. For launcher changes, test default invocation and a custom image or extra flag, for example `./start-agents local-image:dev --network=host`.
+There is no formal test framework or coverage target. For changes, run the syntax checks above and, when Docker or Podman is available, build the image. For launcher changes, test default invocation and a custom image or extra flag, for example `./start-agents --allow-custom-image local-image:dev --network=host`.
 
 ## Commit & Pull Request Guidelines
 

@@ -39,6 +39,7 @@ DEFAULT_IMAGE = "ghcr.io/varchasgopalaswamy/agents:latest"
 DEFAULT_CONTAINER_VENV_DIR = "/home/agent/.venv"
 DEFAULT_CONTAINER_UV_CACHE_DIR = "/home/agent/.cache/uv"
 UNSAFE_OVERRIDE_ENV = "AGENTS_ALLOW_UNSAFE_FLAGS"
+ALLOW_CUSTOM_IMAGE_ENV = "AGENTS_ALLOW_CUSTOM_IMAGE"
 CONFIG_SECTIONS = (
     "start-agents",
     "start-agents.paths",
@@ -122,6 +123,7 @@ class LauncherConfig:
     tty: bool = True
     container_name: str | None = None
     timezone: str | None = None
+    allow_custom_image: bool = False
 
 
 def build_arg_parser() -> configargparse.ArgParser:
@@ -431,6 +433,16 @@ def build_arg_parser() -> configargparse.ArgParser:
             "--volume; use --allow-unsafe-runtime-flag=--flag"
         ),
     )
+    dangerous_group.add(
+        "--allow-custom-image",
+        action="store_true",
+        default=False,
+        env_var=ALLOW_CUSTOM_IMAGE_ENV,
+        help=(
+            "allow running an image other than the default trusted image; "
+            "dangerous because custom images can replace the entrypoint or startup checks"
+        ),
+    )
 
     parser.add(
         "tail",
@@ -515,6 +527,7 @@ def config_from_namespace(namespace: argparse.Namespace) -> LauncherConfig:
         tty=namespace.tty,
         container_name=namespace.container_name,
         timezone=namespace.timezone,
+        allow_custom_image=namespace.allow_custom_image,
         extra_args=flatten_extra_args(namespace.extra_args),
     )
     return config
@@ -594,8 +607,13 @@ PROTECTED_PASSTHROUGH_ENV_PREFIXES = ("AGENTS_",)
 REJECTED_VALUE_FLAGS = {
     "--add-host": "host aliases can redirect trusted names or expose host services",
     "--annotation": "OCI annotations can alter runtime behavior or interact with hooks",
+    "--authfile": "auth files can expose host registry credentials",
     "--cap-add": "the launcher controls the container capability set",
+    "--cert-dir": "certificate directories can expose host trust or client credentials",
     "--cgroupns": "custom cgroup namespaces weaken runtime isolation",
+    "--cidfile": "cid files write host-side container state outside the intended mounts",
+    "--conmon-pidfile": "PID files write host-side container state outside the intended mounts",
+    "--creds": "registry credentials passed to the runtime can expose secrets",
     "--device": "device passthrough can bypass the sandbox",
     "--device-cgroup-rule": "device passthrough can bypass the sandbox",
     "--dns": "custom DNS can bypass egress controls and enable DNS exfiltration",
@@ -607,14 +625,19 @@ REJECTED_VALUE_FLAGS = {
     "--group-add": "extra groups can expand access to mounted host files",
     "--hooks-dir": "OCI hook directories can inject host-controlled runtime behavior",
     "--ipc": "custom IPC namespaces weaken process isolation",
+    "--label-file": "label files read host files outside the intended mounts",
+    "--log-driver": "custom logging can persist or forward container output outside the session",
+    "--log-opt": "custom logging options can write or forward logs outside the session",
     "--mount": "extra mounts can expose or corrupt host files",
     "--network": "the launcher controls networking so the firewall can enforce egress policy",
     "--net": "the launcher controls networking so the firewall can enforce egress policy",
     "--preserve-fd": "preserved host file descriptors can expose host resources",
     "--preserve-fds": "preserved host file descriptors can expose host resources",
     "--pid": "custom PID namespaces weaken process isolation",
+    "--pidfile": "PID files write host-side container state outside the intended mounts",
     "--pod": "joining an existing pod can bypass this container's network policy",
     "--publish": "published ports expose container services outside the sandbox",
+    "--restart": "restart policies can leave containers running after the session ends",
     "--rootfs": "custom root filesystems bypass the launcher-controlled image and entrypoint",
     "--runtime": "custom low-level runtimes can change isolation guarantees",
     "--security-opt": "the launcher controls runtime security options",
@@ -630,13 +653,17 @@ REJECTED_VALUE_FLAGS = {
 }
 
 REJECTED_BOOL_FLAGS = {
+    "--detach": "detached mode can leave the container running after the launcher exits",
     "--env-host": "host environment passthrough can expose credentials and launcher controls",
     "--network-alias": "network aliases can confuse hostname-based policy",
     "--privileged": "privileged mode disables the container isolation this launcher relies on",
     "--publish-all": "published ports expose container services outside the sandbox",
+    "--replace": "replacing existing containers can remove host-side container state",
+    "-d": "detached mode can leave the container running after the launcher exits",
 }
 
 ENV_FLAGS = {"--env", "-e"}
+FALSE_BOOL_VALUES = {"0", "false", "no", "off"}
 
 
 def reject_unsafe_extra_args(extra_args: list[str], allowed_flags: list[str] | None = None) -> None:
@@ -677,6 +704,14 @@ def reject_unsafe_extra_args(extra_args: list[str], allowed_flags: list[str] | N
                 reason = unsafe_flag_value_reason(flag, value)
                 if reason:
                     violations.append(f"{arg}: {reason}")
+            continue
+
+        if flag == "--rm":
+            if value is not None and value.lower() in FALSE_BOOL_VALUES:
+                violations.append(
+                    f"{arg}: disabling automatic cleanup can leave containers running "
+                    "or preserve host-side container state"
+                )
             continue
 
         if flag in REJECTED_BOOL_FLAGS:
@@ -721,8 +756,10 @@ def split_inline_flag_value(arg: str) -> tuple[str, str | None]:
 
 
 def unsafe_short_arg_flag(arg: str) -> str | None:
-    if arg in {"-e", "-u", "-v", "-p"}:
+    if arg in {"-d", "-e", "-u", "-v", "-p"}:
         return arg
+    if arg.startswith("-d") and not arg.startswith("--"):
+        return "-d"
     if arg.startswith("-e") and not arg.startswith("--"):
         return "-e"
     if arg.startswith("-u") and not arg.startswith("--"):
@@ -735,6 +772,8 @@ def unsafe_short_arg_flag(arg: str) -> str | None:
 
 
 def unsafe_short_arg_reason(arg: str) -> str | None:
+    if arg == "-d" or (arg.startswith("-d") and not arg.startswith("--")):
+        return REJECTED_BOOL_FLAGS["-d"]
     if arg in {"-e", "-u", "-v", "-p"}:
         return None
     if arg.startswith("-e") and not arg.startswith("--"):
@@ -787,6 +826,15 @@ def validate_workspace(config: LauncherConfig) -> None:
 
 
 def validate_config(config: LauncherConfig) -> None:
+    validate_workspace(config)
+
+    if config.image != DEFAULT_IMAGE and not config.allow_custom_image:
+        raise ArgumentError(
+            f"refusing custom container image {config.image!r}; pass "
+            f"--allow-custom-image or set {ALLOW_CUSTOM_IMAGE_ENV}=1 only when "
+            "you trust the image entrypoint and startup behavior"
+        )
+
     if config.enable_sudo_password and not config.tty:
         raise ArgumentError("--sudo requires an interactive TTY; remove --no-tty")
 
@@ -796,6 +844,7 @@ def validate_config(config: LauncherConfig) -> None:
     validate_host_mount_source(
         "workspace", config.workspace, allowed_unsafe_paths=config.allowed_unsafe_host_paths
     )
+    validate_workspace_nested_mounts(config.workspace, config.allowed_unsafe_host_paths)
     validate_host_mount_source(
         "history directory",
         config.command_history_dir,
@@ -926,6 +975,64 @@ def validate_host_mount_source(
         raise ArgumentError(
             f"refusing to mount VCS metadata as {label}; use --writable-vcs only when needed"
         )
+
+
+def validate_workspace_nested_mounts(
+    workspace: Path, allowed_unsafe_paths: list[Path] | None = None
+) -> None:
+    rejected_mounts = [
+        path
+        for path in find_nested_mount_points(workspace)
+        if not unsafe_host_path_allowed(path, allowed_unsafe_paths or [])
+    ]
+    if not rejected_mounts:
+        return
+
+    formatted = "\n  ".join(str(path) for path in rejected_mounts)
+    raise ArgumentError(
+        "refusing workspace with nested host mount point(s):\n"
+        f"  {formatted}\n"
+        "Recursive workspace bind mounts can expose host filesystems under "
+        "the project tree. Move or unmount nested mounts, or pass "
+        "--allow-unsafe-host-path PATH for each deliberate mount."
+    )
+
+
+def find_nested_mount_points(workspace: Path) -> list[Path]:
+    mountinfo = Path("/proc/self/mountinfo")
+    if not mountinfo.is_file():
+        return []
+
+    workspace_resolved = workspace.resolve(strict=True)
+    mount_points: set[Path] = set()
+    try:
+        lines = mountinfo.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        mount_point = Path(decode_mountinfo_path(fields[4])).resolve(strict=False)
+        if mount_point == workspace_resolved:
+            continue
+        if path_is_or_under(mount_point, workspace_resolved):
+            mount_points.add(mount_point)
+
+    return sorted(
+        mount_points,
+        key=lambda path: path.relative_to(workspace_resolved).as_posix(),
+    )
+
+
+def decode_mountinfo_path(value: str) -> str:
+    return (
+        value.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
 
 
 def sensitive_host_credential_paths(*, include_agent_config: bool) -> tuple[Path, ...]:
@@ -1168,6 +1275,13 @@ def unsafe_override_warning_lines(config: LauncherConfig) -> list[str]:
     if config.allowed_unsafe_host_paths:
         paths = ", ".join(str(path) for path in config.allowed_unsafe_host_paths)
         warnings.append(f"Specific unsafe host mount path bypasses are enabled: {paths}.")
+
+    if config.allow_custom_image and config.image != DEFAULT_IMAGE:
+        warnings.append(
+            "Custom container image is enabled: "
+            f"{config.image}. Custom images can replace the trusted entrypoint "
+            "or startup behavior."
+        )
 
     return warnings
 

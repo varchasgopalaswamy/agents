@@ -43,6 +43,9 @@ Saved Claude/Gemini/Codex config directories are not mounted by default. Use
 `--writable-agent-config` only when the container should be able to modify host
 agent config. Detected `.git` metadata under the workspace is mounted read-only
 by default; use `--writable-vcs` only when in-container Git writes are needed.
+Workspaces with nested host mount points are rejected by default, because the
+workspace bind mount can otherwise carry unexpected host filesystems into the
+container.
 The Python venv and uv cache are also container-local by default; use
 `--persist-python` to mount host paths for reuse across sessions. Outbound
 network access starts deny-by-default; add provider or registry bundles such as
@@ -94,6 +97,7 @@ command-line options.
 - `AGENTS_RECREATE_VENV=1` recreates the mounted venv on startup
 - `AGENTS_ENABLE_SUDO_PASSWORD=1` prompts for password-based sudo setup during startup
 - `AGENTS_EXTRA_ARGS` adds extra docker/podman run arguments
+- `AGENTS_ALLOW_CUSTOM_IMAGE=1` allows non-default container images
 - `AGENTS_ALLOW_UNSAFE_HOST_PATHS` permits specific otherwise rejected launcher-owned host mount paths
 - `AGENTS_ALLOW_UNSAFE_RUNTIME_FLAGS` permits specific otherwise rejected docker/podman passthrough flags
 - `AGENTS_ALLOW_UNSAFE_FLAGS=1` allows otherwise rejected docker/podman passthrough flags
@@ -149,7 +153,7 @@ start-agents --writable-vcs
 start-agents --forward-secret-env --allow-openai
 
 # Bypass one rejected runtime flag, with a loud warning
-start-agents --allow-unsafe-runtime-flag=--volume \
+start-agents --allow-custom-image --allow-unsafe-runtime-flag=--volume \
   my-image:dev --volume /tmp/tool-cache:/tool-cache
 
 # Bypass one rejected launcher-owned host path, with a loud warning
@@ -189,6 +193,7 @@ mount-agent-config = false
 writable-agent-config = false
 forward-secret-env = false
 writable-vcs = false
+allow-custom-image = false
 allow-unsafe-host-path = []
 allow-unsafe-runtime-flag = []
 extra-args = ["--env", "MY_TOOL_FLAG=1"]
@@ -265,6 +270,9 @@ capability grants to code you may not fully trust:
   poisoning across sessions.
 - `--writable-vcs` allows rewriting refs, objects, hooks, config, and history in
   the host repository.
+- `--allow-custom-image` allows a non-default image. Custom images can replace
+  the trusted entrypoint, skip the firewall bootstrap, or run different startup
+  code before the agent shell starts.
 - `--allow-unsafe-host-path PATH` bypasses launcher mount-source rejection for a
   specific host path. It can expose broad host directories, credential stores,
   runtime sockets, or VCS internals if you name those paths.
@@ -283,10 +291,10 @@ Provider bundles such as `--allow-openai`, `--allow-anthropic`,
 agent operation. They also create channels where an untrusted agent can encode
 workspace secrets into normal-looking API, web, git, or package requests.
 
-The unsafe host-path and runtime-flag bypasses print an explicit warning before
-the launch command. The warning is intentional: if an untrusted agent steals
-tokens, rewrites files, or reaches host services through a bypass you enabled,
-that is the expected risk of the option.
+The unsafe host-path, runtime-flag, and custom-image bypasses print an explicit
+warning before the launch command. The warning is intentional: if an untrusted
+agent steals tokens, rewrites files, or reaches host services through a bypass
+you enabled, that is the expected risk of the option.
 
 ### Python
 
@@ -374,22 +382,25 @@ The launcher also rejects dangerous runtime flags by default, including
 `--privileged`, custom network/DNS/namespace settings, extra capabilities,
 extra mounts, `--volumes-from`, `--env-host`, runtime secrets, preserved file
 descriptors, custom root filesystems, OCI hook controls, device passthrough,
-published ports, entrypoint/user overrides, env-file injection, and attempts to
-override launcher-controlled environment variables. The default runtime
+published ports, entrypoint/user overrides, env-file injection, detached mode,
+restart policies, disabled cleanup, cid/pid file outputs, runtime auth/cert
+file inputs, and attempts to override launcher-controlled environment
+variables. The default runtime
 capability set drops everything, then adds only `NET_ADMIN` for firewall setup
 and `SETUID`/`SETGID` so the root entrypoint can drop to the `agent` user.
 Launcher-owned mount sources reject ambiguous paths containing `:` or newlines,
 broad host mounts such as `/` and the host home directory, container runtime
-sockets, host credential directories, and direct VCS metadata mounts. To bypass
-a specific mount-source rejection, use `--allow-unsafe-host-path PATH`. To pass
-one rejected runtime flag, use `--allow-unsafe-runtime-flag=--flag`; to bypass
-all runtime-flag rejection, set `AGENTS_ALLOW_UNSAFE_FLAGS=1`.
+sockets, host credential directories, direct VCS metadata mounts, and nested
+host mount points inside the workspace. To bypass a specific mount-source
+rejection, use `--allow-unsafe-host-path PATH`. To pass one rejected runtime
+flag, use `--allow-unsafe-runtime-flag=--flag`; to bypass all runtime-flag
+rejection, set `AGENTS_ALLOW_UNSAFE_FLAGS=1`.
 
 ### Custom image or extra flags
 
 ```bash
 # Use a locally built image
-start-agents my-local-agents-image:dev
+start-agents --allow-custom-image my-local-agents-image:dev
 
 # Pass extra docker/podman flags
 start-agents ghcr.io/varchasgopalaswamy/agents:latest --env MY_TOOL_FLAG=1
